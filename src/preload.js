@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('api', {
   saveProject: (project) => ipcRenderer.invoke('project:save', project),
   loadProject: () => ipcRenderer.invoke('project:load'),
   exportSrt: (srtText) => ipcRenderer.invoke('export:srt', srtText),
+  importSrt: () => ipcRenderer.invoke('import:srt'),
   exportFrame: (dataUrl) => ipcRenderer.invoke('export:frame', dataUrl),
   exportVideo: (payload) => ipcRenderer.invoke('export:video', payload),
   readFile: (filePath) => ipcRenderer.invoke('media:read-file', filePath),
@@ -19,11 +20,14 @@ contextBridge.exposeInMainWorld('api', {
       'menu:open-video',
       'menu:save-project',
       'menu:load-project',
+      'menu:import-srt',
       'menu:export-srt',
       'menu:export-video',
       'menu:add-cue',
       'menu:auto-caption',
       'menu:toggle-play',
+      'menu:undo',
+      'menu:redo',
     ];
     if (!allowed.includes(channel)) return;
     ipcRenderer.on(channel, () => handler());

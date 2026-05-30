@@ -124,6 +124,17 @@ ipcMain.handle('export:srt', async (_event, srtText) => {
   return { ok: true, path: result.filePath };
 });
 
+// Import an existing .srt subtitle file as cues.
+ipcMain.handle('import:srt', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: 'Import subtitles (.srt)',
+    properties: ['openFile'],
+    filters: [{ name: 'SubRip Subtitle', extensions: ['srt'] }],
+  });
+  if (result.canceled || result.filePaths.length === 0) return null;
+  return { name: path.basename(result.filePaths[0]), text: fs.readFileSync(result.filePaths[0], 'utf8') };
+});
+
 // Save a rendered frame (PNG) the renderer captured of the video + caption.
 ipcMain.handle('export:frame', async (_event, dataUrl) => {
   const result = await dialog.showSaveDialog(mainWindow, {
@@ -258,10 +269,22 @@ function buildMenu() {
         { label: 'Save Project…', accelerator: 'CmdOrCtrl+S', click: send('menu:save-project') },
         { label: 'Open Project…', accelerator: 'CmdOrCtrl+Shift+O', click: send('menu:load-project') },
         { type: 'separator' },
+        { label: 'Import .srt…', click: send('menu:import-srt') },
         { label: 'Export .srt…', click: send('menu:export-srt') },
         { label: 'Export Video…', click: send('menu:export-video') },
         { type: 'separator' },
         { role: 'quit' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { label: 'Undo', accelerator: 'CmdOrCtrl+Z', click: send('menu:undo') },
+        { label: 'Redo', accelerator: 'CmdOrCtrl+Shift+Z', click: send('menu:redo') },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
       ],
     },
     {

@@ -21,19 +21,29 @@
       </div>
       <div class="toolbar-actions">
         <button id="btn-open" class="btn primary">Open Video…</button>
-        <button id="btn-load" class="btn">Open Project</button>
-        <button id="btn-save" class="btn">Save Project</button>
+        <button id="btn-load" class="btn" title="Open a saved project">Open Project</button>
+        <button id="btn-save" class="btn" title="Save the current project">Save</button>
         <span class="divider"></span>
-        <button id="btn-autocaption" class="btn">✨ Auto-Caption</button>
+        <button id="btn-undo" class="btn icon" title="Undo (Ctrl/Cmd+Z)" disabled>↶</button>
+        <button id="btn-redo" class="btn icon" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>↷</button>
+        <span class="divider"></span>
+        <button id="btn-autocaption" class="btn accent">✨ Auto-Caption</button>
         <select id="ac-model" class="mini-select" title="Whisper model — larger is more accurate but slower">
-          <option value="onnx-community/whisper-tiny.en" selected>Tiny ·EN (fastest)</option>
-          <option value="onnx-community/whisper-base.en">Base ·EN</option>
-          <option value="onnx-community/whisper-small.en">Small ·EN (accurate)</option>
+          <option value="tiny" selected>Tiny (fastest)</option>
+          <option value="base">Base</option>
+          <option value="small">Small (accurate)</option>
         </select>
+        <select id="ac-lang" class="mini-select" title="Spoken language"></select>
+        <label class="mini-check" title="Translate non-English speech into English subtitles">
+          <input type="checkbox" id="ac-translate" /> translate→EN
+        </label>
         <span class="divider"></span>
+        <button id="btn-import-srt" class="btn" title="Import an .srt subtitle file">Import .srt</button>
         <button id="btn-export-srt" class="btn">Export .srt</button>
         <button id="btn-export-frame" class="btn">Save Frame</button>
         <button id="btn-export-video" class="btn">Export Video</button>
+        <span class="divider"></span>
+        <button id="btn-help" class="btn icon" title="Keyboard shortcuts">?</button>
       </div>
     </header>
 
@@ -44,13 +54,13 @@
           <div class="empty-state" id="empty-state">
             <div class="empty-icon">🎬</div>
             <h2>Open a video to begin</h2>
-            <p>Captions overlay directly on the video. Drag and resize the box to place them.</p>
+            <p>Or drag &amp; drop a video file here. Captions overlay directly on the video — drag and resize the box to place them.</p>
             <button id="btn-open-2" class="btn primary big">Open Video…</button>
           </div>
           <video id="video" playsinline></video>
 
           <!-- Draggable / resizable caption container (positioned over the video) -->
-          <div class="caption-container" id="caption-container" hidden>
+          <div class="caption-container" id="caption-container" tabindex="0" hidden>
             <div class="caption-box" id="caption-box"></div>
             <div class="overflow-flag" id="overflow-flag" title="Text overflows the box — shorten the caption or enlarge the box">⚠ overflow</div>
             <span class="handle" data-handle="nw"></span>
@@ -62,6 +72,8 @@
             <span class="handle" data-handle="sw"></span>
             <span class="handle" data-handle="w"></span>
           </div>
+
+          <div class="drop-hint" id="drop-hint">Drop video to load</div>
         </div>
 
         <!-- Transport / scrubber -->
@@ -70,14 +82,14 @@
           <span class="time" id="time-current">0:00.00</span>
           <input type="range" id="seek" class="seek" min="0" max="1000" value="0" step="1" />
           <span class="time" id="time-total">0:00.00</span>
-          <button id="btn-add-cue" class="btn" title="Add a caption cue at the playhead (Ctrl+Enter)">+ Cue at Playhead</button>
+          <button id="btn-add-cue" class="btn" title="Add a caption cue at the playhead (Ctrl+Enter)">+ Cue</button>
         </div>
 
         <!-- Cue list -->
         <div class="cues" id="cues">
           <div class="cues-header">
-            <h3>Captions</h3>
-            <span class="hint">Click a row to edit · times in seconds</span>
+            <h3>Captions <span class="count" id="cue-count"></span></h3>
+            <span class="hint">Double-click the caption on the video to edit it inline · times in seconds</span>
           </div>
           <div class="cue-list" id="cue-list"></div>
         </div>
@@ -87,7 +99,6 @@
       <aside class="inspector">
         <h3>Caption Style</h3>
 
-        <!-- Font & color up top: the easy levers -->
         <label class="field">
           <span>Font</span>
           <select id="style-font">
@@ -163,12 +174,11 @@
 
         <hr />
 
-        <!-- Container box -->
         <div class="box-readout">
           <span>Caption box</span>
           <span class="hint" id="box-readout-val">—</span>
         </div>
-        <p class="muted-note">Drag the box on the video to move it. Drag a handle to resize. The box size and the font size are the only layout levers — if text overflows, shorten the caption or split its timing.</p>
+        <p class="muted-note">Drag the box on the video to move it; drag a handle to resize. Click it and use arrow keys to nudge (Shift = bigger steps). Box size and font size are the only layout levers — if text overflows, shorten the caption or split its timing.</p>
         <button id="btn-reset-box" class="btn small">Reset box position</button>
 
         <details class="bg-section">
@@ -205,6 +215,36 @@
     </main>
 
     <div class="statusbar" id="statusbar">Ready.</div>
+
+    <!-- Progress overlay (auto-caption / export) -->
+    <div class="modal-backdrop" id="progress-modal" hidden>
+      <div class="modal">
+        <h3 id="progress-title">Working…</h3>
+        <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        <p class="progress-detail" id="progress-detail"></p>
+        <button class="btn" id="progress-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Shortcuts help -->
+    <div class="modal-backdrop" id="help-modal" hidden>
+      <div class="modal help">
+        <h3>Keyboard shortcuts</h3>
+        <ul class="shortcuts">
+          <li><kbd>Space</kbd><span>Play / pause</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>O</kbd><span>Open video</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>S</kbd><span>Save project</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>Enter</kbd><span>Add cue at playhead</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>T</kbd><span>Auto-caption</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>Z</kbd><span>Undo</span></li>
+          <li><kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd><span>Redo</span></li>
+          <li><kbd>← → ↑ ↓</kbd><span>Nudge box (when selected)</span></li>
+          <li><kbd>,</kbd> / <kbd>.</kbd><span>Step 1 frame back / forward</span></li>
+          <li><kbd>Double-click</kbd><span>Edit caption text on the video</span></li>
+        </ul>
+        <button class="btn" id="help-close">Close</button>
+      </div>
+    </div>
 
     <script src="renderer.js"></script>
   </body>

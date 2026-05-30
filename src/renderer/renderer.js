@@ -6,8 +6,8 @@
 
 /** @typedef {{ id: string, start: number, end: number, text: string }} Cue */
 
-// The caption box geometry is stored NORMALIZED (0..1) relative to the
-// displayed video content rectangle, so it maps cleanly to any export size.
+// Caption box geometry is NORMALIZED (0..1) relative to the displayed video
+// content rectangle, so it maps cleanly to any export size.
 const DEFAULT_BOX = { x: 0.06, y: 0.6, w: 0.88, h: 0.34 };
 
 const state = {
@@ -36,6 +36,21 @@ const state = {
 
 const SWATCHES = ['#6b1414', '#ffffff', '#000000', '#ffd400', '#19c37d', '#6b8cff', '#e0556b', '#ff8a00'];
 
+// Languages offered for auto-captioning. Names are what Transformers.js expects.
+const LANGS = [
+  ['en', 'English'], ['auto', 'Auto-detect'], ['es', 'spanish'], ['fr', 'french'],
+  ['de', 'german'], ['it', 'italian'], ['pt', 'portuguese'], ['nl', 'dutch'],
+  ['ru', 'russian'], ['zh', 'chinese'], ['ja', 'japanese'], ['ko', 'korean'],
+  ['hi', 'hindi'], ['ar', 'arabic'], ['tr', 'turkish'], ['pl', 'polish'],
+  ['uk', 'ukrainian'], ['vi', 'vietnamese'],
+];
+const LANG_LABELS = {
+  en: 'English', auto: 'Auto-detect', es: 'Spanish', fr: 'French', de: 'German',
+  it: 'Italian', pt: 'Portuguese', nl: 'Dutch', ru: 'Russian', zh: 'Chinese',
+  ja: 'Japanese', ko: 'Korean', hi: 'Hindi', ar: 'Arabic', tr: 'Turkish',
+  pl: 'Polish', uk: 'Ukrainian', vi: 'Vietnamese',
+};
+
 // ---------------------------------------------------------------------------
 // Element references
 // ---------------------------------------------------------------------------
@@ -58,17 +73,9 @@ const boxReadout = $('#box-readout-val');
 // Helpers
 // ---------------------------------------------------------------------------
 
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function clamp(v, lo, hi) {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-function round2(n) {
-  return Math.round(n * 100) / 100;
-}
+function uid() { return Math.random().toString(36).slice(2, 10); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function round2(n) { return Math.round(n * 100) / 100; }
 
 function fmtTime(s) {
   if (!isFinite(s)) s = 0;
@@ -93,21 +100,16 @@ function hexToRgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-// Rectangle (in stage pixel coords) where the video content is actually drawn,
-// accounting for letterboxing within the <video> element.
+// Rectangle (stage pixel coords) where the video content is actually drawn.
 function getVideoRect() {
   const stageRect = stage.getBoundingClientRect();
-  const vw = video.videoWidth;
-  const vh = video.videoHeight;
-  const elW = video.clientWidth;
-  const elH = video.clientHeight;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const elW = video.clientWidth, elH = video.clientHeight;
   if (!vw || !vh || !elW || !elH) {
     return { left: 0, top: 0, width: stageRect.width, height: stageRect.height };
   }
   const scale = Math.min(elW / vw, elH / vh);
-  const dispW = vw * scale;
-  const dispH = vh * scale;
-  // The <video> element is centered in the stage by the grid layout.
+  const dispW = vw * scale, dispH = vh * scale;
   const elLeft = (stageRect.width - elW) / 2;
   const elTop = (stageRect.height - elH) / 2;
   return {
@@ -116,6 +118,96 @@ function getVideoRect() {
     width: dispW,
     height: dispH,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Persistence (style/box/auto preferences)
+// ---------------------------------------------------------------------------
+
+const SETTINGS_KEY = 'jcap.settings.v1';
+let pendingAuto = null;
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      style: state.style,
+      box: state.box,
+      auto: { model: $('#ac-model').value, lang: $('#ac-lang').value, translate: $('#ac-translate').checked },
+    }));
+  } catch (_) {}
+}
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.style) state.style = { ...state.style, ...s.style };
+    if (s.box) state.box = { ...DEFAULT_BOX, ...s.box };
+    if (s.auto) pendingAuto = s.auto;
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo history
+// ---------------------------------------------------------------------------
+
+const history = { stack: [], index: -1, lock: false };
+let snapTimer = null;
+
+function snapshotNow() {
+  if (history.lock) return;
+  const snap = JSON.stringify({ cues: state.cues, style: state.style, box: state.box });
+  if (history.index >= 0 && history.stack[history.index] === snap) return;
+  history.stack = history.stack.slice(0, history.index + 1);
+  history.stack.push(snap);
+  history.index = history.stack.length - 1;
+  if (history.stack.length > 100) { history.stack.shift(); history.index--; }
+  saveSettings();
+  updateUndoButtons();
+}
+
+function recordHistory() {
+  clearTimeout(snapTimer);
+  snapTimer = setTimeout(snapshotNow, 350);
+}
+
+function applySnapshot(snap) {
+  const s = JSON.parse(snap);
+  state.cues = s.cues;
+  state.style = s.style;
+  state.box = s.box;
+  syncControlsFromState();
+  buildSwatches();
+  renderCueList();
+  positionContainer();
+  updateActiveCaption();
+}
+
+function undo() {
+  clearTimeout(snapTimer);
+  if (history.index <= 0) return;
+  history.index--;
+  history.lock = true;
+  applySnapshot(history.stack[history.index]);
+  history.lock = false;
+  updateUndoButtons();
+  setStatus('Undo', true);
+}
+
+function redo() {
+  if (history.index >= history.stack.length - 1) return;
+  history.index++;
+  history.lock = true;
+  applySnapshot(history.stack[history.index]);
+  history.lock = false;
+  updateUndoButtons();
+  setStatus('Redo', true);
+}
+
+function updateUndoButtons() {
+  $('#btn-undo').disabled = history.index <= 0;
+  $('#btn-redo').disabled = history.index >= history.stack.length - 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,13 +262,18 @@ function togglePlay() {
   else video.pause();
 }
 
+function stepFrame(dir) {
+  if (!state.videoUrl) return;
+  video.pause();
+  video.currentTime = clamp(video.currentTime + dir / 30, 0, video.duration || 0);
+}
+
 window.addEventListener('resize', positionContainer);
 
 // ---------------------------------------------------------------------------
-// Caption container: positioning, dragging, resizing
+// Caption container: positioning, dragging, resizing, inline edit, nudging
 // ---------------------------------------------------------------------------
 
-// Place the container element using the normalized box over the video rect.
 function positionContainer() {
   if (container.hidden) return;
   const r = getVideoRect();
@@ -195,20 +292,16 @@ function checkOverflow() {
   container.classList.toggle('overflowing', overflowing && !!captionBox.textContent);
 }
 
-// Pointer-driven move/resize. A handle's data-handle controls which edges move.
 let drag = null;
 
 container.addEventListener('pointerdown', (e) => {
-  if (!state.videoUrl) return;
+  if (!state.videoUrl || container.classList.contains('editing')) return;
   const handle = e.target.closest('.handle');
   const r = getVideoRect();
   drag = {
     handle: handle ? handle.dataset.handle : 'move',
-    startX: e.clientX,
-    startY: e.clientY,
-    box: { ...state.box },
-    rect: r,
-    pointerId: e.pointerId,
+    startX: e.clientX, startY: e.clientY,
+    box: { ...state.box }, rect: r, pointerId: e.pointerId,
   };
   container.setPointerCapture(e.pointerId);
   container.classList.add('dragging');
@@ -220,8 +313,7 @@ container.addEventListener('pointermove', (e) => {
   const dxN = (e.clientX - drag.startX) / drag.rect.width;
   const dyN = (e.clientY - drag.startY) / drag.rect.height;
   const b = { ...drag.box };
-  const MIN = 0.05; // minimum normalized box size
-
+  const MIN = 0.05;
   const h = drag.handle;
   if (h === 'move') {
     b.x = clamp(drag.box.x + dxN, 0, 1 - b.w);
@@ -229,37 +321,85 @@ container.addEventListener('pointermove', (e) => {
   } else {
     if (h.includes('w')) {
       const nx = clamp(drag.box.x + dxN, 0, drag.box.x + drag.box.w - MIN);
-      b.w = drag.box.x + drag.box.w - nx;
-      b.x = nx;
+      b.w = drag.box.x + drag.box.w - nx; b.x = nx;
     }
-    if (h.includes('e')) {
-      b.w = clamp(drag.box.w + dxN, MIN, 1 - drag.box.x);
-    }
+    if (h.includes('e')) b.w = clamp(drag.box.w + dxN, MIN, 1 - drag.box.x);
     if (h.includes('n')) {
       const ny = clamp(drag.box.y + dyN, 0, drag.box.y + drag.box.h - MIN);
-      b.h = drag.box.y + drag.box.h - ny;
-      b.y = ny;
+      b.h = drag.box.y + drag.box.h - ny; b.y = ny;
     }
-    if (h.includes('s')) {
-      b.h = clamp(drag.box.h + dyN, MIN, 1 - drag.box.y);
-    }
+    if (h.includes('s')) b.h = clamp(drag.box.h + dyN, MIN, 1 - drag.box.y);
   }
   state.box = b;
   positionContainer();
 });
 
-function endDrag(e) {
+function endDrag() {
   if (!drag) return;
   try { container.releasePointerCapture(drag.pointerId); } catch (_) {}
   drag = null;
   container.classList.remove('dragging');
+  recordHistory();
 }
 container.addEventListener('pointerup', endDrag);
 container.addEventListener('pointercancel', endDrag);
 
+// Arrow-key nudging when the box is focused.
+container.addEventListener('keydown', (e) => {
+  if (container.classList.contains('editing')) return;
+  const step = e.shiftKey ? 0.02 : 0.005;
+  const b = { ...state.box };
+  let used = true;
+  if (e.key === 'ArrowLeft') b.x = clamp(b.x - step, 0, 1 - b.w);
+  else if (e.key === 'ArrowRight') b.x = clamp(b.x + step, 0, 1 - b.w);
+  else if (e.key === 'ArrowUp') b.y = clamp(b.y - step, 0, 1 - b.h);
+  else if (e.key === 'ArrowDown') b.y = clamp(b.y + step, 0, 1 - b.h);
+  else used = false;
+  if (used) { e.preventDefault(); state.box = b; positionContainer(); recordHistory(); }
+});
+
+// Double-click the caption to edit its text inline on the video.
+let inlineCue = null;
+container.addEventListener('dblclick', () => {
+  if (!state.videoUrl) return;
+  video.pause();
+  let cue = activeCueAt(video.currentTime);
+  if (!cue) {
+    addCueAtPlayhead();
+    cue = activeCueAt(video.currentTime) || state.cues[state.cues.length - 1];
+  }
+  if (!cue) return;
+  inlineCue = cue;
+  captionBox.textContent = cue.text;
+  container.classList.add('editing');
+  captionBox.setAttribute('contenteditable', 'true');
+  captionBox.focus();
+  const sel = window.getSelection();
+  sel.selectAllChildren(captionBox);
+});
+
+captionBox.addEventListener('keydown', (e) => {
+  if (!inlineCue) return;
+  if (e.key === 'Escape' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault();
+    captionBox.blur();
+  }
+});
+captionBox.addEventListener('blur', () => {
+  if (!inlineCue) return;
+  inlineCue.text = captionBox.innerText.replace(/\n+$/, '');
+  captionBox.removeAttribute('contenteditable');
+  container.classList.remove('editing');
+  inlineCue = null;
+  renderCueList();
+  updateActiveCaption();
+  recordHistory();
+});
+
 function resetBox() {
   state.box = { ...DEFAULT_BOX };
   positionContainer();
+  recordHistory();
   setStatus('Reset caption box position.', true);
 }
 
@@ -268,35 +408,33 @@ function resetBox() {
 // ---------------------------------------------------------------------------
 
 function addCueAtPlayhead() {
-  if (!state.videoUrl) {
-    setStatus('Open a video first.', true);
-    return;
-  }
+  if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
   const start = video.currentTime;
   const end = Math.min(video.duration || start + 3, start + 3);
   state.cues.push({ id: uid(), start: round2(start), end: round2(end), text: 'New caption' });
   sortCues();
   renderCueList();
   updateActiveCaption();
-  setStatus('Added a cue. Edit its text in the row below.', true);
+  recordHistory();
+  setStatus('Added a cue.', true);
 }
 
-function sortCues() {
-  state.cues.sort((a, b) => a.start - b.start);
-}
+function sortCues() { state.cues.sort((a, b) => a.start - b.start); }
 
 function deleteCue(id) {
   state.cues = state.cues.filter((c) => c.id !== id);
   renderCueList();
   updateActiveCaption();
+  recordHistory();
 }
 
 function renderCueList() {
   cueListEl.innerHTML = '';
+  $('#cue-count').textContent = state.cues.length ? `(${state.cues.length})` : '';
   if (state.cues.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'no-cues';
-    empty.textContent = 'No captions yet. Move the playhead and click "+ Cue at Playhead".';
+    empty.textContent = 'No captions yet. Use Auto-Caption, Import .srt, or "+ Cue".';
     cueListEl.appendChild(empty);
     return;
   }
@@ -307,40 +445,60 @@ function renderCueList() {
     row.dataset.id = cue.id;
     if (cue.id === state.activeCueId) row.classList.add('active');
 
-    const start = inputNumber(cue.start, (v) => {
-      cue.start = v;
-      sortCues();
-      renderCueList();
-    });
-    const end = inputNumber(cue.end, (v) => { cue.end = v; });
+    const main = document.createElement('div');
+    main.className = 'cue-main';
 
-    const text = document.createElement('input');
-    text.type = 'text';
+    const times = document.createElement('div');
+    times.className = 'cue-times';
+    const start = inputNumber(cue.start, (v) => { cue.start = v; sortCues(); renderCueList(); recordHistory(); });
+    const setStart = setBtn('[', 'Set start to playhead', () => {
+      cue.start = round2(video.currentTime); sortCues(); renderCueList(); recordHistory();
+    });
+    const arrow = document.createElement('span'); arrow.textContent = '→';
+    const end = inputNumber(cue.end, (v) => { cue.end = v; renderCueList(); recordHistory(); });
+    const setEnd = setBtn(']', 'Set end to playhead', () => {
+      cue.end = round2(video.currentTime); renderCueList(); recordHistory();
+    });
+    const dur = document.createElement('span');
+    dur.className = 'cue-dur';
+    dur.textContent = `${Math.max(0, cue.end - cue.start).toFixed(1)}s`;
+    times.append(start, setStart, arrow, end, setEnd, dur);
+
+    const text = document.createElement('textarea');
     text.className = 'cue-text';
+    text.rows = 1;
     text.value = cue.text;
-    text.placeholder = 'Caption text…';
+    text.placeholder = 'Caption text… (Enter for a line break)';
     text.addEventListener('input', () => {
       cue.text = text.value;
+      autoGrow(text);
       updateActiveCaption();
+      recordHistory();
     });
+
+    main.append(times, text);
 
     const actions = document.createElement('div');
     actions.className = 'row-actions';
-    const jump = document.createElement('button');
-    jump.className = 'cue-jump';
-    jump.title = 'Jump to this cue';
-    jump.textContent = '⤓';
-    jump.addEventListener('click', () => { video.currentTime = cue.start; });
-    const del = document.createElement('button');
-    del.className = 'cue-del';
-    del.title = 'Delete cue';
-    del.textContent = '×';
-    del.addEventListener('click', () => deleteCue(cue.id));
-    actions.append(jump, del);
+    actions.append(
+      iconBtn('cue-jump', '⤓', 'Jump to this cue', () => { video.currentTime = cue.start; }),
+      iconBtn('cue-del', '×', 'Delete cue', () => deleteCue(cue.id)),
+    );
 
-    row.append(start, end, text, actions);
+    row.addEventListener('mousedown', (e) => {
+      if (e.target.closest('input, textarea, button')) return;
+      video.currentTime = cue.start;
+    });
+
+    row.append(main, actions);
     cueListEl.appendChild(row);
+    autoGrow(text);
   }
+}
+
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
 function inputNumber(value, onChange) {
@@ -349,27 +507,44 @@ function inputNumber(value, onChange) {
   input.step = '0.1';
   input.min = '0';
   input.value = String(value);
-  input.addEventListener('change', () => {
-    onChange(round2(Math.max(0, Number(input.value) || 0)));
-  });
+  input.addEventListener('change', () => onChange(round2(Math.max(0, Number(input.value) || 0))));
   return input;
+}
+
+function setBtn(label, title, onClick) {
+  const b = document.createElement('button');
+  b.className = 'cue-setbtn';
+  b.textContent = label;
+  b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function iconBtn(cls, label, title, onClick) {
+  const b = document.createElement('button');
+  b.className = cls;
+  b.textContent = label;
+  b.title = title;
+  b.addEventListener('click', onClick);
+  return b;
 }
 
 function activeCueAt(t) {
   let found = null;
-  for (const cue of state.cues) {
-    if (t >= cue.start && t < cue.end) found = cue;
-  }
+  for (const cue of state.cues) if (t >= cue.start && t < cue.end) found = cue;
   return found;
 }
 
 function updateActiveCaption() {
+  if (inlineCue) return; // don't clobber text being edited
   const cue = activeCueAt(video.currentTime);
   const id = cue ? cue.id : null;
   if (id !== state.activeCueId) {
     state.activeCueId = id;
     document.querySelectorAll('.cue-row').forEach((row) => {
-      row.classList.toggle('active', row.dataset.id === id);
+      const on = row.dataset.id === id;
+      row.classList.toggle('active', on);
+      if (on) row.scrollIntoView({ block: 'nearest' });
     });
   }
   captionBox.textContent = cue ? cue.text : '';
@@ -417,6 +592,7 @@ function bindStyleControls() {
       if (label) $(label).textContent = state.style[key];
       applyStyle();
       updateBgFieldVisibility();
+      recordHistory();
     });
   };
 
@@ -446,6 +622,7 @@ function buildSwatches() {
       state.style.color = color;
       $('#style-color').value = color;
       applyStyle();
+      recordHistory();
     });
     wrap.appendChild(sw);
   }
@@ -476,7 +653,6 @@ function syncControlsFromState() {
   updateBgFieldVisibility();
 }
 
-// Presets bundle both style and a sensible box geometry.
 const PRESETS = {
   meme: {
     box: { x: 0.04, y: 0.05, w: 0.92, h: 0.9 },
@@ -506,22 +682,18 @@ function applyPreset(name) {
   syncControlsFromState();
   buildSwatches();
   positionContainer();
+  recordHistory();
   setStatus(`Applied "${name}" preset.`, true);
 }
 
 // ---------------------------------------------------------------------------
-// Project save / load
+// Project save / load + SRT
 // ---------------------------------------------------------------------------
 
 async function saveProject() {
-  const project = {
-    version: 2,
-    videoName: state.videoName,
-    style: state.style,
-    box: state.box,
-    cues: state.cues,
-  };
-  const res = await window.api.saveProject(project);
+  const res = await window.api.saveProject({
+    version: 2, videoName: state.videoName, style: state.style, box: state.box, cues: state.cues,
+  });
   if (res.ok) setStatus(`Saved project to ${res.path}`, true);
 }
 
@@ -532,10 +704,7 @@ async function loadProject() {
   if (project.box) state.box = { ...DEFAULT_BOX, ...project.box };
   if (Array.isArray(project.cues)) {
     state.cues = project.cues.map((c) => ({
-      id: c.id || uid(),
-      start: Number(c.start) || 0,
-      end: Number(c.end) || 0,
-      text: String(c.text || ''),
+      id: c.id || uid(), start: Number(c.start) || 0, end: Number(c.end) || 0, text: String(c.text || ''),
     }));
     sortCues();
   }
@@ -543,12 +712,9 @@ async function loadProject() {
   positionContainer();
   renderCueList();
   updateActiveCaption();
+  snapshotNow();
   setStatus('Project loaded. Re-open the matching video if needed.', true);
 }
-
-// ---------------------------------------------------------------------------
-// Export: SRT
-// ---------------------------------------------------------------------------
 
 function srtTimestamp(s) {
   const ms = Math.round((s % 1) * 1000);
@@ -560,10 +726,7 @@ function srtTimestamp(s) {
 }
 
 async function exportSrt() {
-  if (state.cues.length === 0) {
-    setStatus('No cues to export.', true);
-    return;
-  }
+  if (state.cues.length === 0) { setStatus('No cues to export.', true); return; }
   sortCues();
   const lines = state.cues.map((cue, i) =>
     `${i + 1}\n${srtTimestamp(cue.start)} --> ${srtTimestamp(cue.end)}\n${cue.text}\n`);
@@ -571,46 +734,255 @@ async function exportSrt() {
   if (res.ok) setStatus(`Exported subtitles to ${res.path}`, true);
 }
 
+function parseSrt(text) {
+  const cues = [];
+  const tc = /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/;
+  for (const block of text.replace(/\r/g, '').split(/\n\n+/)) {
+    const ls = block.split('\n');
+    const idx = ls.findIndex((l) => tc.test(l));
+    if (idx === -1) continue;
+    const m = ls[idx].match(tc);
+    const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+    const end = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+    const body = ls.slice(idx + 1).join('\n').trim();
+    if (body) cues.push({ id: uid(), start: round2(start), end: round2(end), text: body });
+  }
+  return cues;
+}
+
+async function importSrt() {
+  const file = await window.api.importSrt();
+  if (!file) return;
+  applyImportedCues(parseSrt(file.text), file.name);
+}
+
+function applyImportedCues(cues, sourceName) {
+  if (!cues.length) { setStatus('No cues found in that file.', true); return; }
+  if (state.cues.length && !window.confirm('Replace the current captions?')) return;
+  state.cues = cues;
+  sortCues();
+  renderCueList();
+  updateActiveCaption();
+  recordHistory();
+  setStatus(`Imported ${cues.length} cues from ${sourceName}.`, true);
+}
+
 // ---------------------------------------------------------------------------
-// Canvas caption rendering (used for frame + video export)
+// Progress modal
+// ---------------------------------------------------------------------------
+
+const progressModal = $('#progress-modal');
+const progressFill = $('#progress-fill');
+let onCancel = null;
+
+function showProgress(title, cancelable) {
+  $('#progress-title').textContent = title;
+  $('#progress-detail').textContent = '';
+  setProgress(null);
+  $('#progress-cancel').style.display = cancelable ? 'block' : 'none';
+  progressModal.hidden = false;
+}
+function setProgress(pct, detail) {
+  if (pct == null) {
+    progressFill.classList.add('indeterminate');
+    progressFill.style.width = '';
+  } else {
+    progressFill.classList.remove('indeterminate');
+    progressFill.style.width = clamp(pct, 0, 100) + '%';
+  }
+  if (detail != null) $('#progress-detail').textContent = detail;
+}
+function hideProgress() { progressModal.hidden = true; onCancel = null; }
+$('#progress-cancel').addEventListener('click', () => { if (onCancel) onCancel(); });
+
+// ---------------------------------------------------------------------------
+// Auto-captioning (local Whisper via a Web Worker)
+// ---------------------------------------------------------------------------
+
+let autoCaptioning = false;
+let transcribeWorker = null;
+
+function getTranscribeWorker() {
+  if (transcribeWorker) return transcribeWorker;
+  transcribeWorker = new Worker(new URL('./transcribe.worker.js', location.href), { type: 'module' });
+  return transcribeWorker;
+}
+
+function resolveModel() {
+  const size = $('#ac-model').value;
+  const lang = $('#ac-lang').value;
+  const translate = $('#ac-translate').checked;
+  const english = lang === 'en' && !translate;
+  return {
+    model: english ? `onnx-community/whisper-${size}.en` : `onnx-community/whisper-${size}`,
+    language: english || lang === 'auto' ? null : LANGS.find((l) => l[0] === lang)?.[1],
+    task: english ? null : (translate ? 'translate' : 'transcribe'),
+  };
+}
+
+async function decodeAudioTo16kMono(arrayBuffer) {
+  const tmpCtx = new AudioContext();
+  let decoded;
+  try {
+    decoded = await tmpCtx.decodeAudioData(arrayBuffer);
+  } finally {
+    tmpCtx.close();
+  }
+  const frames = Math.ceil(decoded.duration * 16000);
+  const offline = new OfflineAudioContext(1, frames, 16000);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0);
+}
+
+function runTranscription(worker, payload, transfer) {
+  return new Promise((resolve, reject) => {
+    const onMsg = (e) => {
+      const m = e.data;
+      if (m.type === 'progress' && m.data) {
+        const p = m.data;
+        if (p.status === 'progress' && p.file) {
+          setProgress(p.progress || 0, `Downloading model · ${p.file}`);
+        } else if (p.status === 'done') {
+          setProgress(100, 'Model ready');
+        }
+      } else if (m.type === 'status') {
+        setProgress(null, m.message);
+      } else if (m.type === 'info') {
+        setProgress(null, m.message);
+      } else if (m.type === 'result') {
+        cleanup(); resolve(m);
+      } else if (m.type === 'error') {
+        cleanup(); reject(new Error(m.message));
+      }
+    };
+    const onErr = () => { cleanup(); reject(new Error('Worker failed to load — check your internet connection.')); };
+    const cleanup = () => {
+      worker.removeEventListener('message', onMsg);
+      worker.removeEventListener('error', onErr);
+    };
+    worker.addEventListener('message', onMsg);
+    worker.addEventListener('error', onErr);
+    worker.postMessage(payload, transfer || []);
+  });
+}
+
+// Merge Whisper's timestamped chunks into nicely sized, readable cues.
+function assembleCues(chunks) {
+  const segs = chunks
+    .map((c) => ({ text: (c.text || '').trim(), s: c.timestamp && c.timestamp[0], e: c.timestamp && c.timestamp[1] }))
+    .filter((c) => c.text && c.s != null);
+
+  const out = [];
+  let cur = null;
+  const MAX_CHARS = 84, MAX_DUR = 6, GAP = 0.8;
+
+  for (const seg of segs) {
+    const end = seg.e != null && seg.e > seg.s ? seg.e : seg.s + 1.5;
+    if (!cur) {
+      cur = { s: seg.s, e: end, text: seg.text };
+    } else {
+      const merged = (cur.text + ' ' + seg.text).replace(/\s+/g, ' ').trim();
+      const gap = seg.s - cur.e;
+      if (merged.length <= MAX_CHARS && end - cur.s <= MAX_DUR && gap <= GAP) {
+        cur.text = merged; cur.e = end;
+      } else {
+        out.push(cur); cur = { s: seg.s, e: end, text: seg.text };
+      }
+    }
+    if (cur && /[.!?…]["')]?$/.test(cur.text) && cur.text.length > 40) { out.push(cur); cur = null; }
+  }
+  if (cur) out.push(cur);
+
+  return out.map((c) => ({ id: uid(), start: round2(Math.max(0, c.s)), end: round2(c.e), text: c.text }));
+}
+
+async function autoCaption() {
+  if (!state.videoPath) {
+    setStatus(state.videoUrl ? 'This video has no readable file path — open it via "Open Video…".' : 'Open a video first.', true);
+    return;
+  }
+  if (autoCaptioning) return;
+  if (state.cues.length && !window.confirm('Replace the current captions with auto-generated ones?')) return;
+
+  autoCaptioning = true;
+  $('#btn-autocaption').disabled = true;
+  let cancelled = false;
+  showProgress('Auto-captioning', true);
+  onCancel = () => {
+    cancelled = true;
+    if (transcribeWorker) { transcribeWorker.terminate(); transcribeWorker = null; }
+    hideProgress();
+    setStatus('Auto-caption cancelled.', true);
+  };
+
+  try {
+    setProgress(null, 'Reading audio…');
+    const buffer = await window.api.readFile(state.videoPath);
+    if (cancelled) return;
+
+    setProgress(null, 'Decoding audio…');
+    const audio = await decodeAudioTo16kMono(buffer);
+    if (cancelled) return;
+
+    const { model, language, task } = resolveModel();
+    setProgress(null, 'Loading model (first run downloads it)…');
+    const worker = getTranscribeWorker();
+    const result = await runTranscription(
+      worker, { type: 'transcribe', model, language, task, audio }, [audio.buffer],
+    );
+    if (cancelled) return;
+
+    const cues = assembleCues(result.chunks);
+    if (!cues.length) { setStatus('No speech detected in the audio.', true); return; }
+    state.cues = cues;
+    sortCues();
+    renderCueList();
+    updateActiveCaption();
+    recordHistory();
+    setStatus(`Auto-captioned: ${cues.length} cues generated. Review and tweak as needed.`, true);
+  } catch (err) {
+    if (!cancelled) {
+      console.error(err);
+      setStatus('Auto-caption failed: ' + ((err && err.message) || err), true);
+    }
+  } finally {
+    autoCaptioning = false;
+    $('#btn-autocaption').disabled = false;
+    if (!cancelled) hideProgress();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Canvas caption rendering (frame + video export)
 // ---------------------------------------------------------------------------
 
 function layoutLines(ctx, text, maxWidth) {
   const lines = [];
   for (const paragraph of text.split('\n')) {
     const words = paragraph.split(/\s+/).filter(Boolean);
-    if (words.length === 0) {
-      lines.push({ words: [], paraEnd: true });
-      continue;
-    }
+    if (words.length === 0) { lines.push({ words: [], paraEnd: true }); continue; }
     let current = [];
     for (const word of words) {
       const candidate = current.concat(word).join(' ');
       if (current.length && ctx.measureText(candidate).width > maxWidth) {
         lines.push({ words: current, paraEnd: false });
         current = [word];
-      } else {
-        current.push(word);
-      }
+      } else current.push(word);
     }
     lines.push({ words: current, paraEnd: true });
   }
   return lines;
 }
 
-// Render the caption onto a canvas, positioned/sized by the normalized box.
 function drawCaption(ctx, canvasW, canvasH, text) {
   if (!text) return;
-  const s = state.style;
-  const b = state.box;
+  const s = state.style, b = state.box;
+  const boxX = b.x * canvasW, boxY = b.y * canvasH, boxW = b.w * canvasW, boxH = b.h * canvasH;
 
-  // Box in canvas pixels.
-  const boxX = b.x * canvasW;
-  const boxY = b.y * canvasH;
-  const boxW = b.w * canvasW;
-  const boxH = b.h * canvasH;
-
-  // Font size is authored against the displayed video; scale to canvas pixels.
   const r = getVideoRect();
   const scale = r.width ? canvasW / r.width : 1;
   const fontSize = s.fontSize * scale;
@@ -620,7 +992,7 @@ function drawCaption(ctx, canvasW, canvasH, text) {
   ctx.save();
   ctx.beginPath();
   ctx.rect(boxX, boxY, boxW, boxH);
-  ctx.clip(); // never draw outside the box (matches on-screen overflow:hidden)
+  ctx.clip();
 
   ctx.font = `${s.weight} ${fontSize}px ${s.font}`;
   ctx.textBaseline = 'top';
@@ -641,9 +1013,7 @@ function drawCaption(ctx, canvasW, canvasH, text) {
   else textY = boxY + (boxH - blockH) / 2;
 
   ctx.fillStyle = s.color;
-  lines.forEach((line, i) => {
-    drawLine(ctx, line, textLeft, textY + i * lineHeight, contentW, fontSize, s);
-  });
+  lines.forEach((line, i) => drawLine(ctx, line, textLeft, textY + i * lineHeight, contentW, fontSize, s));
   ctx.restore();
 }
 
@@ -663,8 +1033,7 @@ function drawLine(ctx, line, left, y, contentW, fontSize, s) {
 
   const joined = words.join(' ');
   const naturalW = ctx.measureText(joined).width;
-  const justifyThisLine =
-    s.align === 'justify' && words.length > 1 && (!line.paraEnd || s.justifyLast);
+  const justifyThisLine = s.align === 'justify' && words.length > 1 && (!line.paraEnd || s.justifyLast);
 
   if (justifyThisLine) {
     const wordsW = words.reduce((sum, w) => sum + ctx.measureText(w).width, 0);
@@ -683,35 +1052,26 @@ function drawLine(ctx, line, left, y, contentW, fontSize, s) {
 }
 
 async function exportFrame() {
-  if (!state.videoUrl) {
-    setStatus('Open a video first.', true);
-    return;
-  }
+  if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
   const canvas = document.createElement('canvas');
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
   const cue = activeCueAt(video.currentTime);
   if (cue) drawCaption(ctx, canvas.width, canvas.height, cue.text);
-
-  const dataUrl = canvas.toDataURL('image/png');
-  const res = await window.api.exportFrame(dataUrl);
+  const res = await window.api.exportFrame(canvas.toDataURL('image/png'));
   if (res.ok) setStatus(`Saved frame to ${res.path}`, true);
 }
 
 // ---------------------------------------------------------------------------
-// Export: burned-in video via canvas capture + MediaRecorder
+// Export burned-in video via canvas capture + MediaRecorder
 // ---------------------------------------------------------------------------
 
 let exporting = false;
 
 async function exportVideo() {
-  if (!state.videoUrl) {
-    setStatus('Open a video first.', true);
-    return;
-  }
+  if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
   if (exporting) return;
   exporting = true;
 
@@ -729,9 +1089,7 @@ async function exportVideo() {
     const audioStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
     audioTracks = audioStream.getAudioTracks();
     audioTracks.forEach((t) => canvasStream.addTrack(t));
-  } catch (_) {
-    // No audio capture available — export silent video.
-  }
+  } catch (_) {}
 
   const mime = pickMime();
   const recorder = new MediaRecorder(canvasStream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
@@ -744,34 +1102,38 @@ async function exportVideo() {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     const cue = activeCueAt(video.currentTime);
     if (cue) drawCaption(ctx, canvas.width, canvas.height, cue.text);
+    const pct = video.duration ? (video.currentTime / video.duration) * 100 : 0;
+    setProgress(pct, `Recording · ${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`);
     rafId = requestAnimationFrame(renderLoop);
   };
 
+  let finished = false;
   const finish = async () => {
+    if (finished) return;
+    finished = true;
     cancelAnimationFrame(rafId);
     video.removeEventListener('ended', onEnded);
-    recorder.stop();
+    if (recorder.state !== 'inactive') recorder.stop();
     await done;
     audioTracks.forEach((t) => t.stop());
 
-    setStatus('Encoding video… this can take a moment.', true);
+    setProgress(null, 'Encoding to MP4…');
     const blob = new Blob(chunks, { type: mime });
     const buffer = await blob.arrayBuffer();
     const recordedExt = mime.includes('mp4') ? 'mp4' : 'webm';
     const res = await window.api.exportVideo({ buffer: new Uint8Array(buffer), recordedExt });
     exporting = false;
-    if (res.ok) {
-      const how = res.transcoded ? ' (transcoded to MP4)' : '';
-      setStatus(`Exported video to ${res.path}${how}`, true);
-    } else if (res.error) {
-      setStatus('Export failed — see error dialog.', true);
-    } else {
-      setStatus('Export cancelled.', true);
-    }
+    hideProgress();
+    if (res.ok) setStatus(`Exported video to ${res.path}${res.transcoded ? ' (MP4)' : ''}`, true);
+    else if (res.error) setStatus('Export failed — see error dialog.', true);
+    else setStatus('Export cancelled.', true);
     if (!wasPaused) video.play();
   };
 
   const onEnded = () => finish();
+
+  showProgress('Exporting captioned video', true);
+  onCancel = () => finish();
 
   video.currentTime = 0;
   await new Promise((r) => {
@@ -779,7 +1141,6 @@ async function exportVideo() {
     video.addEventListener('seeked', handler);
   });
 
-  setStatus('Recording captioned video… playing through once.', true);
   recorder.start();
   renderLoop();
   video.addEventListener('ended', onEnded);
@@ -800,147 +1161,77 @@ function pickMime() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-captioning (local Whisper via a Web Worker)
+// Drag & drop
 // ---------------------------------------------------------------------------
 
-let autoCaptioning = false;
-let transcribeWorker = null;
+const VIDEO_EXT = ['mp4', 'webm', 'mov', 'mkv', 'm4v', 'ogv'];
 
-function getTranscribeWorker() {
-  if (transcribeWorker) return transcribeWorker;
-  transcribeWorker = new Worker(new URL('./transcribe.worker.js', location.href), { type: 'module' });
-  return transcribeWorker;
-}
-
-// Decode the media file's audio to 16 kHz mono PCM — the format Whisper wants.
-async function decodeAudioTo16kMono(arrayBuffer) {
-  const tmpCtx = new AudioContext();
-  let decoded;
-  try {
-    decoded = await tmpCtx.decodeAudioData(arrayBuffer);
-  } finally {
-    tmpCtx.close();
-  }
-  const frames = Math.ceil(decoded.duration * 16000);
-  const offline = new OfflineAudioContext(1, frames, 16000);
-  const src = offline.createBufferSource();
-  src.buffer = decoded;
-  src.connect(offline.destination);
-  src.start();
-  const rendered = await offline.startRendering();
-  return rendered.getChannelData(0); // Float32Array, 16 kHz mono
-}
-
-// Send the audio to the worker and resolve with its transcription result,
-// forwarding progress/status to the status bar along the way.
-function runTranscription(worker, payload, transfer) {
-  return new Promise((resolve, reject) => {
-    const onMsg = (e) => {
-      const m = e.data;
-      if (m.type === 'progress' && m.data) {
-        const p = m.data;
-        if (p.status === 'progress' && p.file) {
-          setStatus(`Downloading model · ${p.file} · ${Math.round(p.progress || 0)}%`, true);
-        } else if (p.status === 'ready') {
-          setStatus('Model ready.', true);
-        }
-      } else if (m.type === 'status' || m.type === 'info') {
-        setStatus(m.message, true);
-      } else if (m.type === 'result') {
-        cleanup();
-        resolve(m);
-      } else if (m.type === 'error') {
-        cleanup();
-        reject(new Error(m.message));
-      }
-    };
-    const onErr = (e) => {
-      cleanup();
-      reject(new Error(e.message || 'Worker failed to load. Check your internet connection.'));
-    };
-    const cleanup = () => {
-      worker.removeEventListener('message', onMsg);
-      worker.removeEventListener('error', onErr);
-    };
-    worker.addEventListener('message', onMsg);
-    worker.addEventListener('error', onErr);
-    worker.postMessage(payload, transfer || []);
+function setupDragDrop() {
+  document.addEventListener('dragover', (e) => { e.preventDefault(); stage.classList.add('drag-over'); });
+  document.addEventListener('dragleave', (e) => { if (e.relatedTarget === null) stage.classList.remove('drag-over'); });
+  document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    stage.classList.remove('drag-over');
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) loadDroppedFile(file);
   });
 }
 
-// Convert Whisper timestamped chunks into editable cues.
-function chunksToCues(chunks) {
-  const cues = [];
-  for (const c of chunks) {
-    const text = (c.text || '').trim();
-    if (!text) continue;
-    const ts = c.timestamp || [];
-    let start = ts[0];
-    let end = ts[1];
-    if (start == null) continue;
-    if (end == null || end <= start) end = start + 2;
-    cues.push({ id: uid(), start: round2(start), end: round2(end), text });
-  }
-  return cues;
-}
-
-async function autoCaption() {
-  if (!state.videoPath) {
-    setStatus('Open a video first.', true);
-    return;
-  }
-  if (autoCaptioning) return;
-  if (state.cues.length && !window.confirm('Replace the current captions with auto-generated ones?')) {
-    return;
-  }
-
-  autoCaptioning = true;
-  const btn = $('#btn-autocaption');
-  btn.disabled = true;
-  try {
-    setStatus('Reading audio…', true);
-    const buffer = await window.api.readFile(state.videoPath);
-
-    setStatus('Decoding audio…', true);
-    const audio = await decodeAudioTo16kMono(buffer);
-
-    const model = $('#ac-model').value;
-    setStatus('Loading model (first run downloads it)…', true);
-    const worker = getTranscribeWorker();
-    const result = await runTranscription(
-      worker,
-      { type: 'transcribe', model, audio },
-      [audio.buffer],
-    );
-
-    const cues = chunksToCues(result.chunks);
-    if (!cues.length) {
-      setStatus('No speech detected in the audio.', true);
-      return;
-    }
-    state.cues = cues;
-    sortCues();
-    renderCueList();
-    updateActiveCaption();
-    setStatus(`Auto-captioned: ${cues.length} cues generated. Review and tweak timing as needed.`, true);
-  } catch (err) {
-    console.error(err);
-    setStatus('Auto-caption failed: ' + ((err && err.message) || err), true);
-  } finally {
-    autoCaptioning = false;
-    btn.disabled = false;
+function loadDroppedFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (file.type.startsWith('video/') || VIDEO_EXT.includes(ext)) {
+    state.videoPath = file.path || null; // Electron exposes the real path
+    loadVideoUrl(URL.createObjectURL(file), file.name);
+    if (!state.videoPath) setStatus('Loaded for playback. Auto-caption needs a file opened via "Open Video…".', true);
+  } else if (ext === 'srt') {
+    file.text().then((t) => applyImportedCues(parseSrt(t), file.name));
+  } else {
+    setStatus('Unsupported file type.', true);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Wiring
+// Auto-caption control population + wiring
 // ---------------------------------------------------------------------------
+
+function buildLangSelect() {
+  const sel = $('#ac-lang');
+  sel.innerHTML = '';
+  for (const [code] of LANGS) {
+    const opt = document.createElement('option');
+    opt.value = code;
+    opt.textContent = LANG_LABELS[code];
+    sel.appendChild(opt);
+  }
+  sel.value = 'en';
+  const syncTranslate = () => {
+    const en = sel.value === 'en';
+    $('#ac-translate').disabled = en;
+    if (en) $('#ac-translate').checked = false;
+  };
+  sel.addEventListener('change', () => { syncTranslate(); saveSettings(); });
+  $('#ac-translate').addEventListener('change', saveSettings);
+  $('#ac-model').addEventListener('change', saveSettings);
+  syncTranslate();
+}
+
+function applyPendingAuto() {
+  if (!pendingAuto) return;
+  if (pendingAuto.model) $('#ac-model').value = pendingAuto.model;
+  if (pendingAuto.lang) $('#ac-lang').value = pendingAuto.lang;
+  if (typeof pendingAuto.translate === 'boolean') $('#ac-translate').checked = pendingAuto.translate;
+  $('#ac-translate').disabled = $('#ac-lang').value === 'en';
+}
+
+function openModal(id) { $(id).hidden = false; }
+function closeModal(id) { $(id).hidden = true; }
 
 function wireUI() {
   $('#btn-open').addEventListener('click', openVideo);
   $('#btn-open-2').addEventListener('click', openVideo);
   $('#btn-load').addEventListener('click', loadProject);
   $('#btn-save').addEventListener('click', saveProject);
+  $('#btn-import-srt').addEventListener('click', importSrt);
   $('#btn-export-srt').addEventListener('click', exportSrt);
   $('#btn-export-frame').addEventListener('click', exportFrame);
   $('#btn-export-video').addEventListener('click', exportVideo);
@@ -948,6 +1239,11 @@ function wireUI() {
   $('#btn-add-cue').addEventListener('click', addCueAtPlayhead);
   $('#btn-reset-box').addEventListener('click', resetBox);
   $('#btn-autocaption').addEventListener('click', autoCaption);
+  $('#btn-undo').addEventListener('click', undo);
+  $('#btn-redo').addEventListener('click', redo);
+  $('#btn-help').addEventListener('click', () => openModal('#help-modal'));
+  $('#help-close').addEventListener('click', () => closeModal('#help-modal'));
+  $('#help-modal').addEventListener('click', (e) => { if (e.target.id === 'help-modal') closeModal('#help-modal'); });
 
   document.querySelectorAll('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
@@ -955,28 +1251,43 @@ function wireUI() {
 
   bindStyleControls();
   buildSwatches();
+  buildLangSelect();
+  applyPendingAuto();
+  setupDragDrop();
 
   document.addEventListener('keydown', (e) => {
     const tag = document.activeElement && document.activeElement.tagName;
-    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-    if (e.code === 'Space' && !typing) {
+    const typing = tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement.isContentEditable;
+    const mod = e.ctrlKey || e.metaKey;
+
+    if (mod && e.key.toLowerCase() === 'z') {
       e.preventDefault();
-      togglePlay();
+      if (e.shiftKey) redo(); else undo();
+      return;
     }
+    if (typing) return;
+    if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+    else if (e.key === ',') stepFrame(-1);
+    else if (e.key === '.') stepFrame(1);
   });
 
   window.api.onMenu('menu:open-video', openVideo);
   window.api.onMenu('menu:save-project', saveProject);
   window.api.onMenu('menu:load-project', loadProject);
+  window.api.onMenu('menu:import-srt', importSrt);
   window.api.onMenu('menu:export-srt', exportSrt);
   window.api.onMenu('menu:export-video', exportVideo);
   window.api.onMenu('menu:add-cue', addCueAtPlayhead);
   window.api.onMenu('menu:auto-caption', autoCaption);
   window.api.onMenu('menu:toggle-play', togglePlay);
+  window.api.onMenu('menu:undo', undo);
+  window.api.onMenu('menu:redo', redo);
 }
 
 // Init
+loadSettings();
 syncControlsFromState();
 renderCueList();
 wireUI();
+snapshotNow();
 setStatus('Ready. Open a video to start captioning.');

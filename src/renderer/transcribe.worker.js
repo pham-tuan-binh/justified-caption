@@ -48,11 +48,15 @@ self.onmessage = async (e) => {
   try {
     const t = await getTranscriber(msg.model);
     self.postMessage({ type: 'status', message: 'Transcribing audio…' });
-    const output = await t(msg.audio, {
+    const options = {
       return_timestamps: true,
       chunk_length_s: 30,
       stride_length_s: 5,
-    });
+    };
+    // language/task only apply to multilingual models; omitted for *.en models.
+    if (msg.language) options.language = msg.language;
+    if (msg.task) options.task = msg.task;
+    const output = await t(msg.audio, options);
     self.postMessage({ type: 'result', chunks: output.chunks || [], text: output.text || '' });
   } catch (err) {
     self.postMessage({ type: 'error', message: String((err && err.message) || err) });
