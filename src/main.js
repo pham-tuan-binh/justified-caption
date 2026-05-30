@@ -3,8 +3,22 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+const { spawn } = require('child_process');
 
 const isDev = process.argv.includes('--dev');
+
+// Path to the bundled ffmpeg binary (used to transcode exports to .mp4).
+let ffmpegPath = null;
+try {
+  ffmpegPath = require('ffmpeg-static');
+  // In a packaged app the binary may live under app.asar.unpacked.
+  if (ffmpegPath && ffmpegPath.includes('app.asar')) {
+    ffmpegPath = ffmpegPath.replace('app.asar', 'app.asar.unpacked');
+  }
+} catch (_) {
+  ffmpegPath = null;
+}
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
@@ -119,17 +133,77 @@ ipcMain.handle('export:frame', async (_event, dataUrl) => {
 });
 
 // Save a fully rendered video (captions burned in) produced by the renderer.
-ipcMain.handle('export:video', async (_event, { buffer, ext }) => {
+// The renderer records a WebM (or, where supported, MP4) blob; here we either
+// write it straight to disk or transcode it to MP4 with the bundled ffmpeg.
+ipcMain.handle('export:video', async (_event, { buffer, recordedExt }) => {
+  const filters = [
+    { name: 'MP4 Video', extensions: ['mp4'] },
+    { name: 'WebM Video', extensions: ['webm'] },
+  ];
+  // If ffmpeg isn't available we can only write the recorded container as-is.
   const result = await dialog.showSaveDialog(mainWindow, {
     title: 'Export captioned video',
-    defaultPath: `captioned.${ext || 'webm'}`,
-    filters: [{ name: 'Video', extensions: [ext || 'webm'] }],
+    defaultPath: ffmpegPath ? 'captioned.mp4' : `captioned.${recordedExt}`,
+    filters: ffmpegPath ? filters : [{ name: 'Video', extensions: [recordedExt] }],
   });
   if (result.canceled || !result.filePath) return { ok: false };
 
-  fs.writeFileSync(result.filePath, Buffer.from(buffer));
-  return { ok: true, path: result.filePath };
+  const target = result.filePath;
+  const targetExt = path.extname(target).slice(1).toLowerCase();
+  const data = Buffer.from(buffer);
+
+  // No transcode needed: the recorded container already matches the target.
+  if (targetExt === recordedExt) {
+    fs.writeFileSync(target, data);
+    return { ok: true, path: target, transcoded: false };
+  }
+
+  if (!ffmpegPath) {
+    const fallback = target.replace(/\.[^.]+$/, '.' + recordedExt);
+    fs.writeFileSync(fallback, data);
+    return { ok: true, path: fallback, transcoded: false, note: 'ffmpeg unavailable' };
+  }
+
+  // Transcode the recorded blob to the target container/codec via ffmpeg.
+  const tmp = path.join(os.tmpdir(), `jcap-${Date.now()}.${recordedExt}`);
+  fs.writeFileSync(tmp, data);
+  try {
+    await transcode(tmp, target);
+  } catch (err) {
+    dialog.showErrorBox('Video export failed', String(err));
+    return { ok: false, error: String(err) };
+  } finally {
+    fs.existsSync(tmp) && fs.unlinkSync(tmp);
+  }
+  return { ok: true, path: target, transcoded: true };
 });
+
+function transcode(input, output) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-i', input,
+      // Ensure even dimensions (yuv420p/H.264 requirement).
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-crf', '20',
+      '-preset', 'medium',
+      '-movflags', '+faststart',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      output,
+    ];
+    const proc = spawn(ffmpegPath, args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}\n${stderr.slice(-1500)}`));
+    });
+  });
+}
 
 ipcMain.handle('shell:show-item', async (_event, filePath) => {
   shell.showItemInFolder(filePath);

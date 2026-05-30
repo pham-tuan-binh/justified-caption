@@ -752,13 +752,20 @@ async function exportVideo() {
     await done;
     audioTracks.forEach((t) => t.stop());
 
+    setStatus('Encoding video… this can take a moment.', true);
     const blob = new Blob(chunks, { type: mime });
     const buffer = await blob.arrayBuffer();
-    const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-    const res = await window.api.exportVideo({ buffer: new Uint8Array(buffer), ext });
+    const recordedExt = mime.includes('mp4') ? 'mp4' : 'webm';
+    const res = await window.api.exportVideo({ buffer: new Uint8Array(buffer), recordedExt });
     exporting = false;
-    if (res.ok) setStatus(`Exported video to ${res.path}`, true);
-    else setStatus('Export cancelled.', true);
+    if (res.ok) {
+      const how = res.transcoded ? ' (transcoded to MP4)' : '';
+      setStatus(`Exported video to ${res.path}${how}`, true);
+    } else if (res.error) {
+      setStatus('Export failed — see error dialog.', true);
+    } else {
+      setStatus('Export cancelled.', true);
+    }
     if (!wasPaused) video.play();
   };
 
