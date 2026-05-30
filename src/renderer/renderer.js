@@ -12,6 +12,7 @@ const DEFAULT_BOX = { x: 0.06, y: 0.6, w: 0.88, h: 0.34 };
 
 const state = {
   videoUrl: /** @type {string|null} */ (null),
+  videoPath: /** @type {string|null} */ (null),
   videoName: /** @type {string|null} */ (null),
   /** @type {Cue[]} */
   cues: [],
@@ -124,6 +125,7 @@ function getVideoRect() {
 async function openVideo() {
   const result = await window.api.openVideo();
   if (!result) return;
+  state.videoPath = result.path;
   loadVideoUrl(result.url, result.name);
 }
 
@@ -798,6 +800,139 @@ function pickMime() {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-captioning (local Whisper via a Web Worker)
+// ---------------------------------------------------------------------------
+
+let autoCaptioning = false;
+let transcribeWorker = null;
+
+function getTranscribeWorker() {
+  if (transcribeWorker) return transcribeWorker;
+  transcribeWorker = new Worker(new URL('./transcribe.worker.js', location.href), { type: 'module' });
+  return transcribeWorker;
+}
+
+// Decode the media file's audio to 16 kHz mono PCM — the format Whisper wants.
+async function decodeAudioTo16kMono(arrayBuffer) {
+  const tmpCtx = new AudioContext();
+  let decoded;
+  try {
+    decoded = await tmpCtx.decodeAudioData(arrayBuffer);
+  } finally {
+    tmpCtx.close();
+  }
+  const frames = Math.ceil(decoded.duration * 16000);
+  const offline = new OfflineAudioContext(1, frames, 16000);
+  const src = offline.createBufferSource();
+  src.buffer = decoded;
+  src.connect(offline.destination);
+  src.start();
+  const rendered = await offline.startRendering();
+  return rendered.getChannelData(0); // Float32Array, 16 kHz mono
+}
+
+// Send the audio to the worker and resolve with its transcription result,
+// forwarding progress/status to the status bar along the way.
+function runTranscription(worker, payload, transfer) {
+  return new Promise((resolve, reject) => {
+    const onMsg = (e) => {
+      const m = e.data;
+      if (m.type === 'progress' && m.data) {
+        const p = m.data;
+        if (p.status === 'progress' && p.file) {
+          setStatus(`Downloading model · ${p.file} · ${Math.round(p.progress || 0)}%`, true);
+        } else if (p.status === 'ready') {
+          setStatus('Model ready.', true);
+        }
+      } else if (m.type === 'status' || m.type === 'info') {
+        setStatus(m.message, true);
+      } else if (m.type === 'result') {
+        cleanup();
+        resolve(m);
+      } else if (m.type === 'error') {
+        cleanup();
+        reject(new Error(m.message));
+      }
+    };
+    const onErr = (e) => {
+      cleanup();
+      reject(new Error(e.message || 'Worker failed to load. Check your internet connection.'));
+    };
+    const cleanup = () => {
+      worker.removeEventListener('message', onMsg);
+      worker.removeEventListener('error', onErr);
+    };
+    worker.addEventListener('message', onMsg);
+    worker.addEventListener('error', onErr);
+    worker.postMessage(payload, transfer || []);
+  });
+}
+
+// Convert Whisper timestamped chunks into editable cues.
+function chunksToCues(chunks) {
+  const cues = [];
+  for (const c of chunks) {
+    const text = (c.text || '').trim();
+    if (!text) continue;
+    const ts = c.timestamp || [];
+    let start = ts[0];
+    let end = ts[1];
+    if (start == null) continue;
+    if (end == null || end <= start) end = start + 2;
+    cues.push({ id: uid(), start: round2(start), end: round2(end), text });
+  }
+  return cues;
+}
+
+async function autoCaption() {
+  if (!state.videoPath) {
+    setStatus('Open a video first.', true);
+    return;
+  }
+  if (autoCaptioning) return;
+  if (state.cues.length && !window.confirm('Replace the current captions with auto-generated ones?')) {
+    return;
+  }
+
+  autoCaptioning = true;
+  const btn = $('#btn-autocaption');
+  btn.disabled = true;
+  try {
+    setStatus('Reading audio…', true);
+    const buffer = await window.api.readFile(state.videoPath);
+
+    setStatus('Decoding audio…', true);
+    const audio = await decodeAudioTo16kMono(buffer);
+
+    const model = $('#ac-model').value;
+    setStatus('Loading model (first run downloads it)…', true);
+    const worker = getTranscribeWorker();
+    const result = await runTranscription(
+      worker,
+      { type: 'transcribe', model, audio },
+      [audio.buffer],
+    );
+
+    const cues = chunksToCues(result.chunks);
+    if (!cues.length) {
+      setStatus('No speech detected in the audio.', true);
+      return;
+    }
+    state.cues = cues;
+    sortCues();
+    renderCueList();
+    updateActiveCaption();
+    setStatus(`Auto-captioned: ${cues.length} cues generated. Review and tweak timing as needed.`, true);
+  } catch (err) {
+    console.error(err);
+    setStatus('Auto-caption failed: ' + ((err && err.message) || err), true);
+  } finally {
+    autoCaptioning = false;
+    btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
 
@@ -812,6 +947,7 @@ function wireUI() {
   $('#btn-play').addEventListener('click', togglePlay);
   $('#btn-add-cue').addEventListener('click', addCueAtPlayhead);
   $('#btn-reset-box').addEventListener('click', resetBox);
+  $('#btn-autocaption').addEventListener('click', autoCaption);
 
   document.querySelectorAll('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
@@ -835,6 +971,7 @@ function wireUI() {
   window.api.onMenu('menu:export-srt', exportSrt);
   window.api.onMenu('menu:export-video', exportVideo);
   window.api.onMenu('menu:add-cue', addCueAtPlayhead);
+  window.api.onMenu('menu:auto-caption', autoCaption);
   window.api.onMenu('menu:toggle-play', togglePlay);
 }
 

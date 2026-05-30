@@ -10,6 +10,10 @@ shorten the caption or split its timing rather than auto-shrinking the text.
 
 ## Features
 
+- **Auto-captioning** — one click transcribes the video's audio into timed cues
+  using Whisper, running locally via [Transformers.js](https://github.com/huggingface/transformers.js)
+  with **WebGPU acceleration** (and a CPU/wasm fallback). No API key. Pick the
+  model size from the toolbar — Tiny (fastest), Base, or Small (most accurate).
 - **Drag-and-drop caption box** — move it and resize it from any of 8 handles, right
   on the video. Geometry is stored normalized, so it survives window resizing and maps
   cleanly to the exported resolution.
@@ -35,6 +39,19 @@ npm start
 
 (Use `npm run dev` to open with DevTools.)
 
+## Auto-captioning
+
+Click **✨ Auto-Caption** (or Caption → Auto-Caption, `Ctrl/Cmd+T`). The app reads
+the video's audio, decodes it to 16 kHz mono, and runs Whisper in a Web Worker to
+produce timestamped cues, which drop straight into the cue list for you to edit.
+
+- **Fast by default:** uses WebGPU when available, falling back to CPU/wasm. The
+  model dropdown picks Tiny / Base / Small (English).
+- **First run downloads the model** (~tens of MB) from Hugging Face, then it's
+  cached for offline reuse. Auto-captioning therefore needs internet the first
+  time a given model is used.
+- Generated cues replace the current ones (you're asked to confirm if cues exist).
+
 ## How export works
 
 Frame and video export draw each video frame to an offscreen canvas and render the
@@ -50,9 +67,10 @@ src/
   main.js               Electron main process: window, menu, file dialogs, IPC
   preload.js            Secure contextBridge API
   renderer/
-    index.html          UI markup
-    styles.css          Styling
-    renderer.js         App logic: video, draggable box, cues, styling, export
+    index.html            UI markup
+    styles.css            Styling
+    renderer.js           App logic: video, draggable box, cues, styling, export
+    transcribe.worker.js  Whisper auto-captioning worker (Transformers.js)
 ```
 
 ## Keyboard
@@ -61,3 +79,4 @@ src/
 - **Ctrl/Cmd+O** — open video
 - **Ctrl/Cmd+S** — save project
 - **Ctrl/Cmd+Enter** — add cue at playhead
+- **Ctrl/Cmd+T** — auto-caption from audio

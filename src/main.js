@@ -8,6 +8,12 @@ const { spawn } = require('child_process');
 
 const isDev = process.argv.includes('--dev');
 
+// Best-effort enable WebGPU so auto-captioning can use the GPU when available.
+// Harmless on machines/platforms without GPU support — the worker falls back
+// to CPU/wasm transcription.
+app.commandLine.appendSwitch('enable-unsafe-webgpu');
+app.commandLine.appendSwitch('enable-features', 'Vulkan');
+
 // Path to the bundled ffmpeg binary (used to transcode exports to .mp4).
 let ffmpegPath = null;
 try {
@@ -209,6 +215,14 @@ ipcMain.handle('shell:show-item', async (_event, filePath) => {
   shell.showItemInFolder(filePath);
 });
 
+// Read a media file's raw bytes so the renderer can decode its audio for
+// auto-captioning (fetching file:// directly is blocked by the CSP).
+ipcMain.handle('media:read-file', async (_event, filePath) => {
+  const buf = fs.readFileSync(filePath);
+  // Return a transferable ArrayBuffer view of exactly this file's bytes.
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+});
+
 // --- helpers ----------------------------------------------------------------
 
 function pathToFileURL(filePath) {
@@ -254,6 +268,7 @@ function buildMenu() {
       label: 'Caption',
       submenu: [
         { label: 'Add Cue at Playhead', accelerator: 'CmdOrCtrl+Enter', click: send('menu:add-cue') },
+        { label: 'Auto-Caption from Audio…', accelerator: 'CmdOrCtrl+T', click: send('menu:auto-caption') },
         { label: 'Play / Pause', accelerator: 'Space', click: send('menu:toggle-play') },
       ],
     },

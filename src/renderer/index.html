@@ -3,7 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' file: blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+          content="default-src 'self';
+                   img-src 'self' data: blob:;
+                   media-src 'self' file: blob: data:;
+                   style-src 'self' 'unsafe-inline';
+                   script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net;
+                   worker-src 'self' blob:;
+                   connect-src 'self' blob: data: https://cdn.jsdelivr.net https://huggingface.co https://*.hf.co https://*.huggingface.co;" />
     <title>Justified Caption</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -17,6 +23,13 @@
         <button id="btn-open" class="btn primary">Open Video…</button>
         <button id="btn-load" class="btn">Open Project</button>
         <button id="btn-save" class="btn">Save Project</button>
+        <span class="divider"></span>
+        <button id="btn-autocaption" class="btn">✨ Auto-Caption</button>
+        <select id="ac-model" class="mini-select" title="Whisper model — larger is more accurate but slower">
+          <option value="onnx-community/whisper-tiny.en" selected>Tiny ·EN (fastest)</option>
+          <option value="onnx-community/whisper-base.en">Base ·EN</option>
+          <option value="onnx-community/whisper-small.en">Small ·EN (accurate)</option>
+        </select>
         <span class="divider"></span>
         <button id="btn-export-srt" class="btn">Export .srt</button>
         <button id="btn-export-frame" class="btn">Save Frame</button>
