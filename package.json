@@ -1,0 +1,22 @@
+{
+  "name": "justified-caption",
+  "version": "1.0.0",
+  "description": "An Electron app to overlay videos with justified meme-style captions and export them.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "keywords": [
+    "electron",
+    "video",
+    "captions",
+    "subtitles",
+    "overlay"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; img-src 'self' data: blob:; media-src 'self' file: blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+    <title>Justified Caption</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="brand">
+        <span class="logo">▦</span>
+        <span>Justified Caption</span>
+      </div>
+      <div class="toolbar-actions">
+        <button id="btn-open" class="btn primary">Open Video…</button>
+        <button id="btn-load" class="btn">Open Project</button>
+        <button id="btn-save" class="btn">Save Project</button>
+        <span class="divider"></span>
+        <button id="btn-export-srt" class="btn">Export .srt</button>
+        <button id="btn-export-frame" class="btn">Save Frame</button>
+        <button id="btn-export-video" class="btn">Export Video</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- Stage: video + draggable caption container -->
+      <section class="stage-pane">
+        <div class="stage" id="stage">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-icon">🎬</div>
+            <h2>Open a video to begin</h2>
+            <p>Captions overlay directly on the video. Drag and resize the box to place them.</p>
+            <button id="btn-open-2" class="btn primary big">Open Video…</button>
+          </div>
+          <video id="video" playsinline></video>
+
+          <!-- Draggable / resizable caption container (positioned over the video) -->
+          <div class="caption-container" id="caption-container" hidden>
+            <div class="caption-box" id="caption-box"></div>
+            <div class="overflow-flag" id="overflow-flag" title="Text overflows the box — shorten the caption or enlarge the box">⚠ overflow</div>
+            <span class="handle" data-handle="nw"></span>
+            <span class="handle" data-handle="n"></span>
+            <span class="handle" data-handle="ne"></span>
+            <span class="handle" data-handle="e"></span>
+            <span class="handle" data-handle="se"></span>
+            <span class="handle" data-handle="s"></span>
+            <span class="handle" data-handle="sw"></span>
+            <span class="handle" data-handle="w"></span>
+          </div>
+        </div>
+
+        <!-- Transport / scrubber -->
+        <div class="transport">
+          <button id="btn-play" class="btn icon" title="Play / Pause (Space)">▶</button>
+          <span class="time" id="time-current">0:00.00</span>
+          <input type="range" id="seek" class="seek" min="0" max="1000" value="0" step="1" />
+          <span class="time" id="time-total">0:00.00</span>
+          <button id="btn-add-cue" class="btn" title="Add a caption cue at the playhead (Ctrl+Enter)">+ Cue at Playhead</button>
+        </div>
+
+        <!-- Cue list -->
+        <div class="cues" id="cues">
+          <div class="cues-header">
+            <h3>Captions</h3>
+            <span class="hint">Click a row to edit · times in seconds</span>
+          </div>
+          <div class="cue-list" id="cue-list"></div>
+        </div>
+      </section>
+
+      <!-- Style inspector -->
+      <aside class="inspector">
+        <h3>Caption Style</h3>
+
+        <!-- Font & color up top: the easy levers -->
+        <label class="field">
+          <span>Font</span>
+          <select id="style-font">
+            <option value="'Arial', 'Helvetica Neue', sans-serif" selected>Arial / Helvetica</option>
+            <option value="'Helvetica Neue', Arial, sans-serif">Helvetica Neue</option>
+            <option value="'Georgia', serif">Georgia (serif)</option>
+            <option value="'Times New Roman', serif">Times New Roman</option>
+            <option value="'Impact', sans-serif">Impact</option>
+            <option value="'Courier New', monospace">Courier (mono)</option>
+            <option value="'Comic Sans MS', cursive">Comic Sans</option>
+            <option value="system-ui, sans-serif">System UI</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Text color</span>
+          <div class="color-row">
+            <input type="color" id="style-color" value="#6b1414" />
+            <div class="swatches" id="swatches"></div>
+          </div>
+        </label>
+
+        <label class="field">
+          <span>Font size <em id="font-size-val">52</em> px</span>
+          <input type="range" id="style-font-size" min="10" max="160" value="52" />
+        </label>
+
+        <hr />
+
+        <label class="field">
+          <span>Text alignment</span>
+          <select id="style-align">
+            <option value="justify" selected>Justified (edge-to-edge)</option>
+            <option value="left">Left</option>
+            <option value="center">Center</option>
+            <option value="right">Right</option>
+          </select>
+        </label>
+
+        <label class="field checkbox">
+          <input type="checkbox" id="style-justify-last" />
+          <span>Justify the last line too</span>
+        </label>
+
+        <label class="field">
+          <span>Vertical align in box</span>
+          <select id="style-valign">
+            <option value="center" selected>Center</option>
+            <option value="top">Top</option>
+            <option value="bottom">Bottom</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Line height <em id="line-height-val">1.15</em></span>
+          <input type="range" id="style-line-height" min="90" max="220" value="115" />
+        </label>
+
+        <label class="field">
+          <span>Weight</span>
+          <select id="style-weight">
+            <option value="400">Regular</option>
+            <option value="600">Semibold</option>
+            <option value="700" selected>Bold</option>
+            <option value="900">Black</option>
+          </select>
+        </label>
+
+        <label class="field checkbox">
+          <input type="checkbox" id="style-shadow" />
+          <span>Text shadow / outline (legibility)</span>
+        </label>
+
+        <hr />
+
+        <!-- Container box -->
+        <div class="box-readout">
+          <span>Caption box</span>
+          <span class="hint" id="box-readout-val">—</span>
+        </div>
+        <p class="muted-note">Drag the box on the video to move it. Drag a handle to resize. The box size and the font size are the only layout levers — if text overflows, shorten the caption or split its timing.</p>
+        <button id="btn-reset-box" class="btn small">Reset box position</button>
+
+        <details class="bg-section">
+          <summary>Optional background</summary>
+          <label class="field" style="margin-top:10px;">
+            <span>Background</span>
+            <select id="style-bg-mode">
+              <option value="none" selected>None (overlay)</option>
+              <option value="translucent">Translucent box</option>
+              <option value="solid">Solid box</option>
+            </select>
+          </label>
+          <label class="field" id="bg-color-field" style="display:none;">
+            <span>Box color</span>
+            <input type="color" id="style-bg-color" value="#ffffff" />
+          </label>
+          <label class="field">
+            <span>Inner padding <em id="padding-val">8</em> px</span>
+            <input type="range" id="style-padding" min="0" max="80" value="8" />
+          </label>
+        </details>
+
+        <hr />
+
+        <div class="presets">
+          <span>Presets</span>
+          <div class="preset-buttons">
+            <button class="btn small" data-preset="meme">Maroon Meme</button>
+            <button class="btn small" data-preset="subtitle">Subtitle</button>
+            <button class="btn small" data-preset="caption">Lower Third</button>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <div class="statusbar" id="statusbar">Ready.</div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
