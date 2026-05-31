@@ -8,42 +8,72 @@
                    media-src 'self' file: blob: data:;
                    style-src 'self' 'unsafe-inline';
                    script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net;
-                   worker-src 'self' blob:;
-                   connect-src 'self' blob: data: https://cdn.jsdelivr.net https://huggingface.co https://*.hf.co https://*.huggingface.co;" />
+                   worker-src 'self' blob: https://cdn.jsdelivr.net;
+                   connect-src 'self' blob: data: https://cdn.jsdelivr.net https://huggingface.co https://*.hf.co https://*.huggingface.co https://*.xethub.hf.co https://cas-bridge.xethub.hf.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.huggingface.co https://cdn-lfs-eu-1.huggingface.co;" />
     <title>Justified Caption</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <!-- Alpha-threshold filter for the "hard edges" (gooey) blur. -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <filter id="cap-threshold" color-interpolation-filters="sRGB">
+        <feColorMatrix type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 22 -9" />
+      </filter>
+    </svg>
+
     <header class="toolbar">
-      <div class="brand">
-        <span class="logo">▦</span>
-        <span>Justified Caption</span>
+      <div class="tb-group">
+        <div class="menu" data-menu>
+          <button class="tb-btn menu-trigger" type="button" aria-haspopup="true">File<span class="caret"></span></button>
+          <div class="menu-panel">
+            <button id="btn-open" class="menu-item">Open Video…<span class="menu-key">⌘O</span></button>
+            <button id="btn-load" class="menu-item">Open Project…<span class="menu-key">⌘⇧O</span></button>
+            <button id="btn-save" class="menu-item">Save Project<span class="menu-key">⌘S</span></button>
+            <div class="menu-sep"></div>
+            <button id="btn-import-srt" class="menu-item">Import Subtitles (.srt)…</button>
+          </div>
+        </div>
+
+        <span class="tb-sep"></span>
+        <button id="btn-undo" class="tb-btn icon" title="Undo (⌘Z)" disabled>↶</button>
+        <button id="btn-redo" class="tb-btn icon" title="Redo (⌘⇧Z)" disabled>↷</button>
+
+        <span class="tb-sep"></span>
+        <div class="split-btn">
+          <button id="btn-autocaption" class="tb-btn accent" title="Transcribe the video to captions">Auto-Caption</button>
+          <div class="menu" data-menu>
+            <button class="tb-btn accent split-caret menu-trigger" type="button" title="Auto-caption options"><span class="caret"></span></button>
+            <div class="menu-panel menu-panel-form">
+              <label class="menu-field">
+                <span>Model</span>
+                <select id="ac-model" class="select" title="Larger is more accurate but slower">
+                  <option value="tiny" selected>Tiny — fastest</option>
+                  <option value="base">Base</option>
+                  <option value="small">Small — accurate</option>
+                </select>
+              </label>
+              <label class="menu-field">
+                <span>Language</span>
+                <select id="ac-lang" class="select"></select>
+              </label>
+              <label class="menu-check">
+                <input type="checkbox" id="ac-translate" /> Translate to English
+              </label>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="toolbar-actions">
-        <button id="btn-open" class="btn primary">Open Video…</button>
-        <button id="btn-load" class="btn" title="Open a saved project">Open Project</button>
-        <button id="btn-save" class="btn" title="Save the current project">Save</button>
-        <span class="divider"></span>
-        <button id="btn-undo" class="btn icon" title="Undo (Ctrl/Cmd+Z)" disabled>↶</button>
-        <button id="btn-redo" class="btn icon" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>↷</button>
-        <span class="divider"></span>
-        <button id="btn-autocaption" class="btn accent">✨ Auto-Caption</button>
-        <select id="ac-model" class="mini-select" title="Whisper model — larger is more accurate but slower">
-          <option value="tiny" selected>Tiny (fastest)</option>
-          <option value="base">Base</option>
-          <option value="small">Small (accurate)</option>
-        </select>
-        <select id="ac-lang" class="mini-select" title="Spoken language"></select>
-        <label class="mini-check" title="Translate non-English speech into English subtitles">
-          <input type="checkbox" id="ac-translate" /> translate→EN
-        </label>
-        <span class="divider"></span>
-        <button id="btn-import-srt" class="btn" title="Import an .srt subtitle file">Import .srt</button>
-        <button id="btn-export-srt" class="btn">Export .srt</button>
-        <button id="btn-export-frame" class="btn">Save Frame</button>
-        <button id="btn-export-video" class="btn">Export Video</button>
-        <span class="divider"></span>
-        <button id="btn-help" class="btn icon" title="Keyboard shortcuts">?</button>
+
+      <div class="tb-group">
+        <div class="menu" data-menu>
+          <button class="tb-btn menu-trigger" type="button" aria-haspopup="true">Export<span class="caret"></span></button>
+          <div class="menu-panel menu-panel-right">
+            <button id="btn-export-video" class="menu-item">Export Video…</button>
+            <button id="btn-export-srt" class="menu-item">Export Subtitles (.srt)…</button>
+            <button id="btn-export-frame" class="menu-item">Save Current Frame…</button>
+          </div>
+        </div>
+        <button id="btn-help" class="tb-btn icon" title="Keyboard shortcuts">?</button>
       </div>
     </header>
 
@@ -52,17 +82,17 @@
       <section class="stage-pane">
         <div class="stage" id="stage">
           <div class="empty-state" id="empty-state">
-            <div class="empty-icon">🎬</div>
             <h2>Open a video to begin</h2>
-            <p>Or drag &amp; drop a video file here. Captions overlay directly on the video — drag and resize the box to place them.</p>
+            <p>Or drag and drop a video file here. Captions overlay directly on the video — drag and resize the box to place them.</p>
             <button id="btn-open-2" class="btn primary big">Open Video…</button>
           </div>
           <video id="video" playsinline></video>
 
           <!-- Draggable / resizable caption container (positioned over the video) -->
           <div class="caption-container" id="caption-container" tabindex="0" hidden>
-            <div class="caption-box" id="caption-box"></div>
-            <div class="overflow-flag" id="overflow-flag" title="Text overflows the box — shorten the caption or enlarge the box">⚠ overflow</div>
+            <canvas class="caption-canvas" id="caption-canvas"></canvas>
+            <div class="caption-box" id="caption-box" hidden></div>
+            <div class="overflow-flag" id="overflow-flag" title="Text overflows the box — shorten the caption or enlarge the box">Overflow</div>
             <span class="handle" data-handle="nw"></span>
             <span class="handle" data-handle="n"></span>
             <span class="handle" data-handle="ne"></span>
@@ -72,6 +102,10 @@
             <span class="handle" data-handle="sw"></span>
             <span class="handle" data-handle="w"></span>
           </div>
+
+          <!-- Center-line snapping guides (shown while dragging snaps) -->
+          <div class="snap-guide snap-guide-v" id="snap-v" hidden></div>
+          <div class="snap-guide snap-guide-h" id="snap-h" hidden></div>
 
           <div class="drop-hint" id="drop-hint">Drop video to load</div>
         </div>
@@ -97,120 +131,180 @@
 
       <!-- Style inspector -->
       <aside class="inspector">
-        <h3>Caption Style</h3>
+        <div class="insp-head">Inspector</div>
 
         <label class="field">
-          <span>Font</span>
-          <select id="style-font">
-            <option value="'Arial', 'Helvetica Neue', sans-serif" selected>Arial / Helvetica</option>
-            <option value="'Helvetica Neue', Arial, sans-serif">Helvetica Neue</option>
-            <option value="'Georgia', serif">Georgia (serif)</option>
-            <option value="'Times New Roman', serif">Times New Roman</option>
-            <option value="'Impact', sans-serif">Impact</option>
-            <option value="'Courier New', monospace">Courier (mono)</option>
-            <option value="'Comic Sans MS', cursive">Comic Sans</option>
-            <option value="system-ui, sans-serif">System UI</option>
+          <span>Preset</span>
+          <select id="style-preset">
+            <option value="" selected>Custom</option>
+            <option value="meme">Maroon Meme</option>
+            <option value="subtitle">Subtitle</option>
+            <option value="caption">Lower Third</option>
           </select>
         </label>
 
-        <label class="field">
-          <span>Text color</span>
-          <div class="color-row">
-            <input type="color" id="style-color" value="#6b1414" />
-            <div class="swatches" id="swatches"></div>
+        <details class="section" open>
+          <summary>Text</summary>
+          <div class="section-body">
+            <!-- Color (custom picker) + Italic + Outline on one row, up top. -->
+            <div class="row-inline">
+              <div class="menu color-menu" data-menu>
+                <button type="button" class="color-trigger menu-trigger" title="Text color">
+                  <span class="color-chip" id="color-chip"></span>
+                </button>
+                <div class="menu-panel menu-panel-form color-panel">
+                  <input type="color" id="style-color" value="#6b1414" />
+                  <div class="swatches" id="swatches"></div>
+                </div>
+              </div>
+              <label class="check-inline"><input type="checkbox" id="style-italic" /><span>Italic</span></label>
+              <label class="check-inline"><input type="checkbox" id="style-shadow" /><span>Outline</span></label>
+            </div>
+
+            <!-- Outline settings (revealed when Outline is on). -->
+            <div class="outline-settings" id="outline-settings" hidden>
+              <label class="field">
+                <span>Outline width <em id="outline-width-val">2</em><i>px</i></span>
+                <input type="range" id="style-outline-width" min="0.5" max="16" step="0.5" value="2" />
+              </label>
+              <label class="field">
+                <span>Outline color</span>
+                <div class="color-menu inline-color" data-menu>
+                  <button type="button" class="color-trigger menu-trigger" title="Outline color">
+                    <span class="color-chip" id="outline-chip"></span>
+                  </button>
+                  <div class="menu-panel menu-panel-form color-panel">
+                    <input type="color" id="style-outline-color" value="#000000" />
+                  </div>
+                </div>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Font</span>
+              <select id="style-font">
+                <option value="'Arial', 'Helvetica Neue', sans-serif" selected>Arial / Helvetica</option>
+                <option value="'Helvetica Neue', Arial, sans-serif">Helvetica Neue</option>
+                <option value="'Georgia', serif">Georgia</option>
+                <option value="'Times New Roman', serif">Times New Roman</option>
+                <option value="'Impact', sans-serif">Impact</option>
+                <option value="'Courier New', monospace">Courier</option>
+                <option value="'Comic Sans MS', cursive">Comic Sans</option>
+                <option value="system-ui, sans-serif">System UI</option>
+              </select>
+            </label>
+
+            <div class="field-row">
+              <label class="field">
+                <span>Weight</span>
+                <select id="style-weight">
+                  <option value="300">Light</option>
+                  <option value="400">Regular</option>
+                  <option value="500">Medium</option>
+                  <option value="600">Semibold</option>
+                  <option value="700" selected>Bold</option>
+                  <option value="800">Extrabold</option>
+                  <option value="900">Black</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Case</span>
+                <select id="style-case">
+                  <option value="none" selected>As typed</option>
+                  <option value="upper">UPPER</option>
+                  <option value="lower">lower</option>
+                </select>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>Size <em id="font-size-val">52</em><i>px</i></span>
+              <input type="range" id="style-font-size" min="10" max="160" value="52" />
+            </label>
+            <label class="field">
+              <span>Letter spacing <em id="letter-spacing-val">0</em><i>px</i></span>
+              <input type="range" id="style-letter-spacing" min="-10" max="40" step="0.5" value="0" />
+            </label>
+            <label class="field">
+              <span>Word spacing <em id="word-spacing-val">0</em><i>px</i></span>
+              <input type="range" id="style-word-spacing" min="-10" max="80" step="1" value="0" />
+            </label>
+
+            <label class="field">
+              <span>Blur <em id="blur-val">0</em><i>px</i></span>
+              <input type="range" id="style-blur" min="0" max="30" step="0.5" value="0" />
+            </label>
+            <label class="field checkbox">
+              <input type="checkbox" id="style-hardedge" />
+              <span>Hard edges (threshold blur)</span>
+            </label>
           </div>
-        </label>
-
-        <label class="field">
-          <span>Font size <em id="font-size-val">52</em> px</span>
-          <input type="range" id="style-font-size" min="10" max="160" value="52" />
-        </label>
-
-        <hr />
-
-        <label class="field">
-          <span>Text alignment</span>
-          <select id="style-align">
-            <option value="justify" selected>Justified (edge-to-edge)</option>
-            <option value="left">Left</option>
-            <option value="center">Center</option>
-            <option value="right">Right</option>
-          </select>
-        </label>
-
-        <label class="field checkbox">
-          <input type="checkbox" id="style-justify-last" />
-          <span>Justify the last line too</span>
-        </label>
-
-        <label class="field">
-          <span>Vertical align in box</span>
-          <select id="style-valign">
-            <option value="center" selected>Center</option>
-            <option value="top">Top</option>
-            <option value="bottom">Bottom</option>
-          </select>
-        </label>
-
-        <label class="field">
-          <span>Line height <em id="line-height-val">1.15</em></span>
-          <input type="range" id="style-line-height" min="90" max="220" value="115" />
-        </label>
-
-        <label class="field">
-          <span>Weight</span>
-          <select id="style-weight">
-            <option value="400">Regular</option>
-            <option value="600">Semibold</option>
-            <option value="700" selected>Bold</option>
-            <option value="900">Black</option>
-          </select>
-        </label>
-
-        <label class="field checkbox">
-          <input type="checkbox" id="style-shadow" />
-          <span>Text shadow / outline (legibility)</span>
-        </label>
-
-        <hr />
-
-        <div class="box-readout">
-          <span>Caption box</span>
-          <span class="hint" id="box-readout-val">—</span>
-        </div>
-        <p class="muted-note">Drag the box on the video to move it; drag a handle to resize. Click it and use arrow keys to nudge (Shift = bigger steps). Box size and font size are the only layout levers — if text overflows, shorten the caption or split its timing.</p>
-        <button id="btn-reset-box" class="btn small">Reset box position</button>
-
-        <details class="bg-section">
-          <summary>Optional background</summary>
-          <label class="field" style="margin-top:10px;">
-            <span>Background</span>
-            <select id="style-bg-mode">
-              <option value="none" selected>None (overlay)</option>
-              <option value="translucent">Translucent box</option>
-              <option value="solid">Solid box</option>
-            </select>
-          </label>
-          <label class="field" id="bg-color-field" style="display:none;">
-            <span>Box color</span>
-            <input type="color" id="style-bg-color" value="#ffffff" />
-          </label>
-          <label class="field">
-            <span>Inner padding <em id="padding-val">8</em> px</span>
-            <input type="range" id="style-padding" min="0" max="80" value="8" />
-          </label>
         </details>
 
-        <hr />
-
-        <div class="presets">
-          <span>Presets</span>
-          <div class="preset-buttons">
-            <button class="btn small" data-preset="meme">Maroon Meme</button>
-            <button class="btn small" data-preset="subtitle">Subtitle</button>
-            <button class="btn small" data-preset="caption">Lower Third</button>
+        <details class="section" open>
+          <summary>Alignment</summary>
+          <div class="section-body">
+            <label class="field">
+              <span>Horizontal</span>
+              <select id="style-align">
+                <option value="justify" selected>Justified (edge-to-edge)</option>
+                <option value="left">Left</option>
+                <option value="center">Center</option>
+                <option value="right">Right</option>
+              </select>
+            </label>
+            <label class="field checkbox">
+              <input type="checkbox" id="style-justify-last" />
+              <span>Justify the last line too</span>
+            </label>
+            <label class="field">
+              <span>Vertical</span>
+              <select id="style-valign">
+                <option value="center" selected>Center</option>
+                <option value="top">Top</option>
+                <option value="bottom">Bottom</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Line height <em id="line-height-val">1.15</em></span>
+              <input type="range" id="style-line-height" min="90" max="220" value="115" />
+            </label>
           </div>
-        </div>
+        </details>
+
+        <details class="section">
+          <summary>Background</summary>
+          <div class="section-body">
+            <label class="field">
+              <span>Mode</span>
+              <select id="style-bg-mode">
+                <option value="none" selected>None (overlay)</option>
+                <option value="translucent">Translucent box</option>
+                <option value="solid">Solid box</option>
+              </select>
+            </label>
+            <label class="field" id="bg-color-field" style="display:none;">
+              <span>Box color</span>
+              <input type="color" id="style-bg-color" value="#ffffff" />
+            </label>
+            <label class="field">
+              <span>Inner padding <em id="padding-val">8</em><i>px</i></span>
+              <input type="range" id="style-padding" min="0" max="80" value="8" />
+            </label>
+          </div>
+        </details>
+
+        <details class="section" open>
+          <summary>Caption Box</summary>
+          <div class="section-body">
+            <div class="box-readout">
+              <span>Position · Size</span>
+              <span class="hint" id="box-readout-val">—</span>
+            </div>
+            <button id="btn-reset-box" class="btn small full">Reset box position</button>
+            <p class="muted-note">Drag to move, handles to resize. Edges &amp; center snap (hold Alt to bypass). Arrow keys nudge — Shift for larger steps.</p>
+          </div>
+        </details>
       </aside>
     </main>
 
@@ -246,6 +340,8 @@
       </div>
     </div>
 
+    <script src="lib.js"></script>
+    <script src="caption-render.js"></script>
     <script src="renderer.js"></script>
   </body>
 </html>

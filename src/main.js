@@ -12,7 +12,11 @@ const isDev = process.argv.includes('--dev');
 // Harmless on machines/platforms without GPU support — the worker falls back
 // to CPU/wasm transcription.
 app.commandLine.appendSwitch('enable-unsafe-webgpu');
-app.commandLine.appendSwitch('enable-features', 'Vulkan');
+// Vulkan for WebGPU; PlatformHEVCDecoderSupport lets Chromium use the OS
+// (VideoToolbox on macOS) to play HEVC/H.265 — common for iPhone .mov files —
+// when the underlying build supports it. If it doesn't, the renderer falls
+// back to transcoding the file with the bundled ffmpeg (see below).
+app.commandLine.appendSwitch('enable-features', 'Vulkan,PlatformHEVCDecoderSupport');
 
 // Path to the bundled ffmpeg binary (used to transcode exports to .mp4).
 let ffmpegPath = null;
@@ -195,22 +199,78 @@ ipcMain.handle('export:video', async (_event, { buffer, recordedExt }) => {
   return { ok: true, path: target, transcoded: true };
 });
 
+// Temp playback copies we create for formats Chromium can't decode (HEVC,
+// .mkv, …). Tracked so we can clean them up on quit.
+const playbackTemps = new Set();
+
+// Fast, lossless container remux: copy the existing video/audio streams into an
+// .mp4 (no re-encode). This is what makes HEVC iPhone .mov files playable —
+// Chromium can decode HEVC via the OS but can't demux QuickTime, so we just
+// repackage. Near-instant; preserves full quality.
+ipcMain.handle('media:remux-playback', async (_event, srcPath) => {
+  if (!ffmpegPath) return { ok: false, error: 'The bundled ffmpeg is unavailable.' };
+  if (!srcPath || !fs.existsSync(srcPath)) return { ok: false, error: 'Source file not found.' };
+  const out = path.join(os.tmpdir(), `jcap-remux-${Date.now()}.mp4`);
+  try {
+    // -tag:v hvc1 so the resulting mp4 advertises the codec string Chromium plays.
+    await runFfmpeg(['-y', '-i', srcPath, '-c', 'copy', '-tag:v', 'hvc1', '-movflags', '+faststart', out]);
+  } catch (err) {
+    fs.existsSync(out) && fs.unlinkSync(out);
+    return { ok: false, error: String(err) };
+  }
+  playbackTemps.add(out);
+  return { ok: true, path: out, url: pathToFileURL(out) };
+});
+
+// Transcode a source video to an H.264/AAC MP4 the <video> element can play.
+// Returns a file:// URL + the temp path, or { ok:false }.
+ipcMain.handle('media:transcode-playback', async (_event, srcPath) => {
+  if (!ffmpegPath) return { ok: false, error: 'The bundled ffmpeg is unavailable, so this format cannot be converted.' };
+  if (!srcPath || !fs.existsSync(srcPath)) return { ok: false, error: 'Source file not found.' };
+
+  const out = path.join(os.tmpdir(), `jcap-play-${Date.now()}.mp4`);
+  const args = [
+    '-y',
+    '-i', srcPath,
+    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-crf', '20',
+    '-preset', 'veryfast',
+    '-movflags', '+faststart',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    out,
+  ];
+  try {
+    await runFfmpeg(args);
+  } catch (err) {
+    fs.existsSync(out) && fs.unlinkSync(out);
+    return { ok: false, error: String(err) };
+  }
+  playbackTemps.add(out);
+  return { ok: true, path: out, url: pathToFileURL(out) };
+});
+
 function transcode(input, output) {
+  return runFfmpeg([
+    '-y',
+    '-i', input,
+    // Ensure even dimensions (yuv420p/H.264 requirement).
+    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-crf', '20',
+    '-preset', 'medium',
+    '-movflags', '+faststart',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    output,
+  ]);
+}
+
+function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const args = [
-      '-y',
-      '-i', input,
-      // Ensure even dimensions (yuv420p/H.264 requirement).
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-      '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p',
-      '-crf', '20',
-      '-preset', 'medium',
-      '-movflags', '+faststart',
-      '-c:a', 'aac',
-      '-b:a', '192k',
-      output,
-    ];
     const proc = spawn(ffmpegPath, args);
     let stderr = '';
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
@@ -258,6 +318,12 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
+// Remove any temp playback copies we transcoded this session.
+app.on('will-quit', () => {
+  for (const f of playbackTemps) { try { fs.unlinkSync(f); } catch (_) {} }
+  playbackTemps.clear();
+});
+
 function buildMenu() {
   const send = (channel) => () => mainWindow && mainWindow.webContents.send(channel);
   const template = [
@@ -291,6 +357,7 @@ function buildMenu() {
       label: 'Caption',
       submenu: [
         { label: 'Add Cue at Playhead', accelerator: 'CmdOrCtrl+Enter', click: send('menu:add-cue') },
+        { label: 'Split Captions to Fit Box', click: send('menu:split-all-to-fit') },
         { label: 'Auto-Caption from Audio…', accelerator: 'CmdOrCtrl+T', click: send('menu:auto-caption') },
         { label: 'Play / Pause', accelerator: 'Space', click: send('menu:toggle-play') },
       ],

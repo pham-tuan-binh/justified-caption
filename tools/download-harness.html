@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Must mirror src/renderer/index.html exactly to test the real CSP. -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self';
+                   img-src 'self' data: blob:;
+                   media-src 'self' file: blob: data:;
+                   style-src 'self' 'unsafe-inline';
+                   script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net;
+                   worker-src 'self' blob: https://cdn.jsdelivr.net;
+                   connect-src 'self' blob: data: https://cdn.jsdelivr.net https://huggingface.co https://*.hf.co https://*.huggingface.co https://*.xethub.hf.co https://cas-bridge.xethub.hf.co https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.huggingface.co https://cdn-lfs-eu-1.huggingface.co;" />
+    <title>Download Harness</title>
+  </head>
+  <body>
+    <script src="./download-harness-page.js"></script>
+  </body>
+</html>

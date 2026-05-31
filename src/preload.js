@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('api', {
   exportFrame: (dataUrl) => ipcRenderer.invoke('export:frame', dataUrl),
   exportVideo: (payload) => ipcRenderer.invoke('export:video', payload),
   readFile: (filePath) => ipcRenderer.invoke('media:read-file', filePath),
+  remuxPlayback: (filePath) => ipcRenderer.invoke('media:remux-playback', filePath),
+  transcodePlayback: (filePath) => ipcRenderer.invoke('media:transcode-playback', filePath),
   showItemInFolder: (filePath) => ipcRenderer.invoke('shell:show-item', filePath),
 
   // Menu -> renderer events.
@@ -24,6 +26,7 @@ contextBridge.exposeInMainWorld('api', {
       'menu:export-srt',
       'menu:export-video',
       'menu:add-cue',
+      'menu:split-all-to-fit',
       'menu:auto-caption',
       'menu:toggle-play',
       'menu:undo',

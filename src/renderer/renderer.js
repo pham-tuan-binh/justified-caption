@@ -27,9 +27,17 @@ const state = {
     lineHeight: 1.15,
     color: '#6b1414',
     weight: '700',
+    italic: false,
+    letterSpacing: 0,
+    wordSpacing: 0,
+    textCase: 'none',
+    blur: 0,
+    hardEdge: false,
     bgMode: 'none',
     bgColor: '#ffffff',
     shadow: false,
+    outlineWidth: 2,
+    outlineColor: '#000000',
     padding: 8,
   },
 };
@@ -44,22 +52,25 @@ const LANGS = [
   ['hi', 'hindi'], ['ar', 'arabic'], ['tr', 'turkish'], ['pl', 'polish'],
   ['uk', 'ukrainian'], ['vi', 'vietnamese'],
 ];
-const LANG_LABELS = {
-  en: 'English', auto: 'Auto-detect', es: 'Spanish', fr: 'French', de: 'German',
-  it: 'Italian', pt: 'Portuguese', nl: 'Dutch', ru: 'Russian', zh: 'Chinese',
-  ja: 'Japanese', ko: 'Korean', hi: 'Hindi', ar: 'Arabic', tr: 'Turkish',
-  pl: 'Polish', uk: 'Ukrainian', vi: 'Vietnamese',
-};
+// Display labels are derived from LANGS — the second element is the name
+// Transformers.js expects (lowercase for most; 'en'/'auto' already title-cased),
+// so title-casing it yields the UI label without a second source of truth.
+const LANG_LABELS = Object.fromEntries(
+  LANGS.map(([code, name]) => [code, name.charAt(0).toUpperCase() + name.slice(1)]),
+);
 
 // ---------------------------------------------------------------------------
 // Element references
 // ---------------------------------------------------------------------------
 
+// Pure helpers (uid, clamp, round2, fmtTime, hexToRgba, srtTimestamp,
+// parseSrt, assembleCues, layoutLines) come from lib.js, loaded first.
 const $ = (sel) => document.querySelector(sel);
 
 const video = $('#video');
 const stage = $('#stage');
 const container = $('#caption-container');
+const captionCanvas = $('#caption-canvas');
 const captionBox = $('#caption-box');
 const cueListEl = $('#cue-list');
 const seek = $('#seek');
@@ -73,31 +84,22 @@ const boxReadout = $('#box-readout-val');
 // Helpers
 // ---------------------------------------------------------------------------
 
-function uid() { return Math.random().toString(36).slice(2, 10); }
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-function round2(n) { return Math.round(n * 100) / 100; }
-
-function fmtTime(s) {
-  if (!isFinite(s)) s = 0;
-  const m = Math.floor(s / 60);
-  const sec = (s % 60).toFixed(2).padStart(5, '0');
-  return `${m}:${sec}`;
-}
-
 let statusTimer = null;
 function setStatus(msg, flash = false) {
   statusbar.textContent = msg;
+  statusbar.classList.remove('error');
   statusbar.classList.toggle('flash', flash);
   if (statusTimer) clearTimeout(statusTimer);
   if (flash) statusTimer = setTimeout(() => statusbar.classList.remove('flash'), 2500);
 }
 
-function hexToRgba(hex, alpha) {
-  const h = hex.replace('#', '');
-  const r = parseInt(h.substring(0, 2), 16);
-  const g = parseInt(h.substring(2, 4), 16);
-  const b = parseInt(h.substring(4, 6), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+// Errors recolor the whole status bar red so they're impossible to miss.
+function setError(msg) {
+  statusbar.textContent = msg;
+  statusbar.classList.remove('flash');
+  statusbar.classList.add('error');
+  if (statusTimer) clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => statusbar.classList.remove('error'), 7000);
 }
 
 // Rectangle (stage pixel coords) where the video content is actually drawn.
@@ -217,11 +219,14 @@ function updateUndoButtons() {
 async function openVideo() {
   const result = await window.api.openVideo();
   if (!result) return;
+  convertHandledFor = null; // allow a fresh conversion attempt for this pick
   state.videoPath = result.path;
   loadVideoUrl(result.url, result.name);
 }
 
 function loadVideoUrl(url, name) {
+  // Release the previous blob URL (from a prior drag-drop) to avoid leaking it.
+  if (state.videoUrl && state.videoUrl.startsWith('blob:')) URL.revokeObjectURL(state.videoUrl);
   state.videoUrl = url;
   state.videoName = name || 'video';
   video.src = url;
@@ -245,11 +250,107 @@ video.addEventListener('timeupdate', () => {
 video.addEventListener('play', () => {
   btnPlay.textContent = '❚❚';
   container.classList.add('playing');
+  startCaptionLoop();
 });
 video.addEventListener('pause', () => {
   btnPlay.textContent = '▶';
   container.classList.remove('playing');
+  stopCaptionLoop();
 });
+video.addEventListener('ended', stopCaptionLoop);
+
+// Surface decode/codec failures instead of silently showing a black stage,
+// and offer to convert formats Chromium can't play (HEVC .mov, .mkv, …) using
+// the bundled ffmpeg.
+let convertingPlayback = false;
+let convertHandledFor = null; // original path we've already attempted to convert
+
+video.addEventListener('error', () => {
+  const err = video.error;
+  if (!err) return;
+  console.error('Video error', err.code, err.message);
+
+  const src = state.videoPath;
+  const recoverable = (err.code === 3 || err.code === 4) && src
+    && window.api.remuxPlayback && !convertingPlayback && convertHandledFor !== src;
+  if (recoverable) { recoverPlayback(src); return; }
+
+  const MAP = {
+    1: 'Loading was aborted.',
+    2: 'A network error occurred while loading the video.',
+    3: 'The video could not be decoded (corrupt or unsupported codec).',
+    4: "This format isn't supported (e.g. HEVC/H.265 or an .mkv container). Convert it to H.264 .mp4, or open a different file.",
+  };
+  const why = MAP[err.code] || 'The video could not be played.';
+  // Roll back so the empty state returns and another file can be opened.
+  stage.classList.remove('has-video');
+  container.hidden = true;
+  state.videoUrl = null;
+  setError('Cannot play this video — ' + why);
+});
+
+// Probe whether a URL actually decodes, without disturbing the main <video>.
+function canDecode(url) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    v.muted = true; v.preload = 'metadata';
+    let done = false;
+    const finish = (ok) => { if (done) return; done = true; v.removeAttribute('src'); v.load(); resolve(ok); };
+    v.addEventListener('loadeddata', () => finish(true), { once: true });
+    v.addEventListener('error', () => finish(false), { once: true });
+    setTimeout(() => finish(false), 10000);
+    v.src = url;
+  });
+}
+
+function useConvertedPlayback(res, srcPath, note) {
+  loadVideoUrl(res.url, state.videoName); // play the converted copy…
+  state.videoPath = srcPath;              // …but keep the original for audio auto-caption
+  setStatus(note, true);
+}
+function failPlayback(msg) {
+  stage.classList.remove('has-video');
+  container.hidden = true;
+  state.videoUrl = null;
+  setError(msg);
+}
+
+// HEVC etc.: the OS can decode the video, Chromium just can't demux the .mov
+// container — so try a fast lossless remux first, and only re-encode if that
+// still won't play.
+async function recoverPlayback(srcPath) {
+  convertingPlayback = true;
+  convertHandledFor = srcPath;
+  showProgress('Preparing video', false);
+  try {
+    setProgress(null, 'Repackaging container (no re-encode)…');
+    let res = await window.api.remuxPlayback(srcPath);
+    if (res && res.ok && await canDecode(res.url)) {
+      useConvertedPlayback(res, srcPath, 'Repackaged for playback — no quality loss. Original file unchanged.');
+      return;
+    }
+
+    // Remux didn't yield a playable file → fall back to a full re-encode (slow).
+    if (!window.api.transcodePlayback || !window.confirm(
+      "This video needs to be re-encoded to play (its codec isn't supported, not just its container).\n\n" +
+      'Re-encode a playable copy now? This can take a while for long clips. Your original file is unchanged.')) {
+      failPlayback('Cannot play this video — unsupported codec.');
+      return;
+    }
+    setProgress(null, 'Re-encoding to H.264 — this can take a moment…');
+    res = await window.api.transcodePlayback(srcPath);
+    if (res && res.ok && await canDecode(res.url)) {
+      useConvertedPlayback(res, srcPath, 'Converted to a playable copy. Original file unchanged.');
+    } else {
+      failPlayback('Could not convert this video — ' + ((res && res.error) || 'unknown error'));
+    }
+  } catch (e) {
+    failPlayback('Could not prepare this video — ' + ((e && e.message) || e));
+  } finally {
+    convertingPlayback = false;
+    hideProgress();
+  }
+}
 
 seek.addEventListener('input', () => {
   if (!state.videoUrl) return;
@@ -284,12 +385,43 @@ function positionContainer() {
   container.style.height = b.h * r.height + 'px';
   boxReadout.textContent =
     `${Math.round(b.x * 100)},${Math.round(b.y * 100)} · ${Math.round(b.w * 100)}×${Math.round(b.h * 100)}%`;
-  checkOverflow();
+  renderCaptionCanvas();
 }
 
-function checkOverflow() {
-  const overflowing = captionBox.scrollHeight > captionBox.clientHeight + 1;
-  container.classList.toggle('overflowing', overflowing && !!captionBox.textContent);
+// Draw the active cue onto the overlay canvas via the shared render module, so
+// the preview is identical to the exported video (brat stretch + word reveal).
+function renderCaptionCanvas() {
+  if (!captionCanvas || container.hidden) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = container.clientWidth, cssH = container.clientHeight;
+  if (!cssW || !cssH) return;
+  const needW = Math.round(cssW * dpr), needH = Math.round(cssH * dpr);
+  if (captionCanvas.width !== needW || captionCanvas.height !== needH) {
+    captionCanvas.width = needW; captionCanvas.height = needH;
+    captionCanvas.style.width = cssW + 'px'; captionCanvas.style.height = cssH + 'px';
+  }
+  const ctx = captionCanvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  if (inlineCue) { container.classList.remove('overflowing'); return; } // editor overlay handles display
+
+  const cue = activeCueAt(video.currentTime);
+  if (!cue) { container.classList.remove('overflowing'); return; }
+  const s = state.style;
+  const hasWords = cue.words && cue.words.length;
+  const res = CaptionRender.drawCaption(ctx, {
+    x: 0, y: 0, w: cssW, h: cssH, pad: s.padding,
+    font: s.font, weight: s.weight, fontSize: s.fontSize, lineHeight: s.fontSize * s.lineHeight,
+    italic: s.italic, letterSpacing: s.letterSpacing, wordSpacing: s.wordSpacing, textCase: s.textCase,
+    blur: s.blur, hardEdge: s.hardEdge,
+    color: s.color, align: s.align, justifyLast: s.justifyLast, valign: s.valign,
+    bgMode: s.bgMode, bgColor: s.bgColor,
+    outline: s.shadow, outlineWidth: s.outlineWidth, outlineColor: s.outlineColor,
+    text: hasWords ? undefined : cue.text,
+    words: hasWords ? cue.words : undefined,
+    atTime: video.currentTime,
+  });
+  container.classList.toggle('overflowing', !!res.overflow);
 }
 
 let drag = null;
@@ -315,30 +447,82 @@ container.addEventListener('pointermove', (e) => {
   const b = { ...drag.box };
   const MIN = 0.05;
   const h = drag.handle;
+  // Snap targets: video edges (0, 1) and center (0.5). Hold Alt to bypass.
+  const SNAP = 0.012;
+  const TARGETS = [0, 0.5, 1];
+  let guideX = null, guideY = null;
+
   if (h === 'move') {
     b.x = clamp(drag.box.x + dxN, 0, 1 - b.w);
     b.y = clamp(drag.box.y + dyN, 0, 1 - b.h);
+    if (!e.altKey) {
+      // Snap whichever of left/center/right edge is nearest a target.
+      const sx = snapAxis([b.x, b.x + b.w / 2, b.x + b.w], TARGETS, SNAP);
+      if (sx) { b.x = clamp(b.x + sx.delta, 0, 1 - b.w); guideX = sx.line; }
+      const sy = snapAxis([b.y, b.y + b.h / 2, b.y + b.h], TARGETS, SNAP);
+      if (sy) { b.y = clamp(b.y + sy.delta, 0, 1 - b.h); guideY = sy.line; }
+    }
   } else {
     if (h.includes('w')) {
-      const nx = clamp(drag.box.x + dxN, 0, drag.box.x + drag.box.w - MIN);
+      let nx = clamp(drag.box.x + dxN, 0, drag.box.x + drag.box.w - MIN);
+      if (!e.altKey) { const t = nearestTarget(nx, TARGETS, SNAP); if (t != null) { nx = t; guideX = t; } }
       b.w = drag.box.x + drag.box.w - nx; b.x = nx;
     }
-    if (h.includes('e')) b.w = clamp(drag.box.w + dxN, MIN, 1 - drag.box.x);
+    if (h.includes('e')) {
+      let right = clamp(drag.box.x + drag.box.w + dxN, drag.box.x + MIN, 1);
+      if (!e.altKey) { const t = nearestTarget(right, TARGETS, SNAP); if (t != null) { right = t; guideX = t; } }
+      b.w = right - drag.box.x;
+    }
     if (h.includes('n')) {
-      const ny = clamp(drag.box.y + dyN, 0, drag.box.y + drag.box.h - MIN);
+      let ny = clamp(drag.box.y + dyN, 0, drag.box.y + drag.box.h - MIN);
+      if (!e.altKey) { const t = nearestTarget(ny, TARGETS, SNAP); if (t != null) { ny = t; guideY = t; } }
       b.h = drag.box.y + drag.box.h - ny; b.y = ny;
     }
-    if (h.includes('s')) b.h = clamp(drag.box.h + dyN, MIN, 1 - drag.box.y);
+    if (h.includes('s')) {
+      let bot = clamp(drag.box.y + drag.box.h + dyN, drag.box.y + MIN, 1);
+      if (!e.altKey) { const t = nearestTarget(bot, TARGETS, SNAP); if (t != null) { bot = t; guideY = t; } }
+      b.h = bot - drag.box.y;
+    }
   }
   state.box = b;
   positionContainer();
+  showSnapGuides(guideX, guideY);
 });
+
+// Closest (ref → target) pairing across multiple box references; returns the
+// delta to apply and the target line, or null if none within `snap`.
+function snapAxis(refs, targets, snap) {
+  let best = null;
+  for (const pos of refs) for (const t of targets) {
+    const d = Math.abs(pos - t);
+    if (d < snap && (!best || d < best.d)) best = { d, delta: t - pos, line: t };
+  }
+  return best;
+}
+function nearestTarget(pos, targets, snap) {
+  let best = null;
+  for (const t of targets) { const d = Math.abs(pos - t); if (d < snap && (!best || d < best.d)) best = { d, t }; }
+  return best ? best.t : null;
+}
+
+// Show alignment guides at normalized line positions (0/0.5/1) or hide (null).
+function showSnapGuides(gx, gy) {
+  const v = $('#snap-v'), hLine = $('#snap-h');
+  if (!v || !hLine) return;
+  const r = getVideoRect();
+  if (gx != null) { v.hidden = false; v.style.left = r.left + gx * r.width + 'px'; v.style.top = r.top + 'px'; v.style.height = r.height + 'px'; }
+  else v.hidden = true;
+  if (gy != null) { hLine.hidden = false; hLine.style.top = r.top + gy * r.height + 'px'; hLine.style.left = r.left + 'px'; hLine.style.width = r.width + 'px'; }
+  else hLine.hidden = true;
+}
+function hideSnapGuides() { showSnapGuides(null, null); }
 
 function endDrag() {
   if (!drag) return;
   try { container.releasePointerCapture(drag.pointerId); } catch (_) {}
   drag = null;
   container.classList.remove('dragging');
+  hideSnapGuides();
   recordHistory();
 }
 container.addEventListener('pointerup', endDrag);
@@ -370,9 +554,12 @@ container.addEventListener('dblclick', () => {
   }
   if (!cue) return;
   inlineCue = cue;
+  // Show the DOM edit overlay (the canvas display pauses while editing).
   captionBox.textContent = cue.text;
+  captionBox.hidden = false;
   container.classList.add('editing');
   captionBox.setAttribute('contenteditable', 'true');
+  renderCaptionCanvas(); // clears the canvas while the overlay is up
   captionBox.focus();
   const sel = window.getSelection();
   sel.selectAllChildren(captionBox);
@@ -387,8 +574,11 @@ captionBox.addEventListener('keydown', (e) => {
 });
 captionBox.addEventListener('blur', () => {
   if (!inlineCue) return;
-  inlineCue.text = captionBox.innerText.replace(/\n+$/, '');
+  const edited = captionBox.innerText.replace(/\n+$/, '');
+  if (edited !== inlineCue.text) delete inlineCue.words; // per-word timings are now stale
+  inlineCue.text = edited;
   captionBox.removeAttribute('contenteditable');
+  captionBox.hidden = true;
   container.classList.remove('editing');
   inlineCue = null;
   renderCueList();
@@ -421,6 +611,44 @@ function addCueAtPlayhead() {
 
 function sortCues() { state.cues.sort((a, b) => a.start - b.start); }
 
+// Replace a cue with the fewest consecutive chunks that each fit the caption box
+// at the current style/size, splitting its time span across them. No-op (with a
+// status hint) when the cue already fits.
+function splitCueToFit(cue) {
+  if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
+  const idx = state.cues.findIndex((c) => c.id === cue.id);
+  if (idx === -1) return;
+  const pieces = splitToFit(cue, makeFitsFn());
+  if (pieces.length <= 1) { setStatus('That caption already fits the box.', true); return; }
+  state.cues.splice(idx, 1, ...pieces);
+  sortCues();
+  renderCueList();
+  updateActiveCaption();
+  recordHistory();
+  setStatus(`Split into ${pieces.length} cues that fit the box.`, true);
+}
+
+// Split every cue that overflows the box (toolbar / menu convenience).
+function splitAllCuesToFit() {
+  if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
+  if (!state.cues.length) { setStatus('No cues to split.', true); return; }
+  const fits = makeFitsFn();
+  const next = [];
+  let splits = 0;
+  for (const cue of state.cues) {
+    const pieces = splitToFit(cue, fits);
+    if (pieces.length > 1) splits++;
+    next.push(...pieces);
+  }
+  if (!splits) { setStatus('All captions already fit the box.', true); return; }
+  state.cues = next;
+  sortCues();
+  renderCueList();
+  updateActiveCaption();
+  recordHistory();
+  setStatus(`Split ${splits} overflowing ${splits === 1 ? 'cue' : 'cues'} to fit.`, true);
+}
+
 function deleteCue(id) {
   state.cues = state.cues.filter((c) => c.id !== id);
   renderCueList();
@@ -450,15 +678,14 @@ function renderCueList() {
 
     const times = document.createElement('div');
     times.className = 'cue-times';
-    const start = inputNumber(cue.start, (v) => { cue.start = v; sortCues(); renderCueList(); recordHistory(); });
-    const setStart = setBtn('[', 'Set start to playhead', () => {
-      cue.start = round2(video.currentTime); sortCues(); renderCueList(); recordHistory();
-    });
+    // Keep end >= start so the cue stays valid (an inverted cue never displays).
+    const setStartTime = (v) => { cue.start = v; if (cue.end < cue.start) cue.end = cue.start; sortCues(); renderCueList(); recordHistory(); };
+    const setEndTime = (v) => { cue.end = Math.max(v, cue.start); renderCueList(); recordHistory(); };
+    const start = inputNumber(cue.start, setStartTime);
+    const setStart = setBtn('[', 'Set start to playhead', () => setStartTime(round2(video.currentTime)));
     const arrow = document.createElement('span'); arrow.textContent = '→';
-    const end = inputNumber(cue.end, (v) => { cue.end = v; renderCueList(); recordHistory(); });
-    const setEnd = setBtn(']', 'Set end to playhead', () => {
-      cue.end = round2(video.currentTime); renderCueList(); recordHistory();
-    });
+    const end = inputNumber(cue.end, setEndTime);
+    const setEnd = setBtn(']', 'Set end to playhead', () => setEndTime(round2(video.currentTime)));
     const dur = document.createElement('span');
     dur.className = 'cue-dur';
     dur.textContent = `${Math.max(0, cue.end - cue.start).toFixed(1)}s`;
@@ -471,6 +698,7 @@ function renderCueList() {
     text.placeholder = 'Caption text… (Enter for a line break)';
     text.addEventListener('input', () => {
       cue.text = text.value;
+      delete cue.words; // editing invalidates per-word reveal timings
       autoGrow(text);
       updateActiveCaption();
       recordHistory();
@@ -481,7 +709,7 @@ function renderCueList() {
     const actions = document.createElement('div');
     actions.className = 'row-actions';
     actions.append(
-      iconBtn('cue-jump', '⤓', 'Jump to this cue', () => { video.currentTime = cue.start; }),
+      iconBtn('cue-split', '✂', 'Split into chunks that fit the box', () => splitCueToFit(cue)),
       iconBtn('cue-del', '×', 'Delete cue', () => deleteCue(cue.id)),
     );
 
@@ -536,7 +764,6 @@ function activeCueAt(t) {
 }
 
 function updateActiveCaption() {
-  if (inlineCue) return; // don't clobber text being edited
   const cue = activeCueAt(video.currentTime);
   const id = cue ? cue.id : null;
   if (id !== state.activeCueId) {
@@ -547,9 +774,18 @@ function updateActiveCaption() {
       if (on) row.scrollIntoView({ block: 'nearest' });
     });
   }
-  captionBox.textContent = cue ? cue.text : '';
-  checkOverflow();
+  renderCaptionCanvas();
 }
+
+// Re-draw the caption every frame while playing so the word reveal is smooth
+// (timeupdate alone fires too coarsely).
+let captionRaf = 0;
+function startCaptionLoop() {
+  cancelAnimationFrame(captionRaf);
+  const tick = () => { renderCaptionCanvas(); captionRaf = requestAnimationFrame(tick); };
+  captionRaf = requestAnimationFrame(tick);
+}
+function stopCaptionLoop() { cancelAnimationFrame(captionRaf); captionRaf = 0; updateActiveCaption(); }
 
 // ---------------------------------------------------------------------------
 // Styling
@@ -570,6 +806,11 @@ function applyStyle() {
   box.style.setProperty('--cap-line', String(s.lineHeight));
   box.style.setProperty('--cap-weight', s.weight);
   box.style.setProperty('--cap-pad', s.padding + 'px');
+  // New type knobs on the inline-edit overlay so editing matches the canvas.
+  box.style.fontStyle = s.italic ? 'italic' : 'normal';
+  box.style.letterSpacing = s.letterSpacing + 'px';
+  box.style.wordSpacing = s.wordSpacing + 'px';
+  box.style.textTransform = s.textCase === 'upper' ? 'uppercase' : s.textCase === 'lower' ? 'lowercase' : 'none';
 
   let bg;
   if (s.bgMode === 'none') bg = 'transparent';
@@ -577,8 +818,20 @@ function applyStyle() {
   else bg = s.bgColor;
   box.style.setProperty('--cap-bg', bg);
 
-  box.classList.toggle('shadow', s.shadow);
-  checkOverflow();
+  // Real outline (stroke) on the inline-edit overlay too.
+  box.style.webkitTextStroke = s.shadow ? `${s.outlineWidth}px ${s.outlineColor}` : '';
+  // Blur (+ optional hard-edge threshold) on the inline-edit overlay too.
+  const filterParts = [];
+  if (s.blur > 0) filterParts.push(`blur(${s.blur}px)`);
+  if (s.hardEdge) filterParts.push('url(#cap-threshold)');
+  box.style.filter = filterParts.join(' ') || 'none';
+  // Reflect current colors in the custom picker chips.
+  const chip = $('#color-chip');
+  if (chip) chip.style.background = s.color;
+  const ochip = $('#outline-chip');
+  if (ochip) ochip.style.background = s.outlineColor;
+  updateOutlineVisibility();
+  renderCaptionCanvas();
 }
 
 function bindStyleControls() {
@@ -604,9 +857,17 @@ function bindStyleControls() {
   bind('#style-line-height', 'lineHeight', (v) => Number(v) / 100, '#line-height-val');
   bind('#style-color', 'color');
   bind('#style-weight', 'weight');
+  bind('#style-letter-spacing', 'letterSpacing', (v) => Number(v), '#letter-spacing-val');
+  bind('#style-word-spacing', 'wordSpacing', (v) => Number(v), '#word-spacing-val');
+  bind('#style-blur', 'blur', (v) => Number(v), '#blur-val');
+  bind('#style-hardedge', 'hardEdge', (v) => !!v);
+  bind('#style-case', 'textCase');
+  bind('#style-italic', 'italic', (v) => !!v);
   bind('#style-bg-mode', 'bgMode');
   bind('#style-bg-color', 'bgColor');
   bind('#style-shadow', 'shadow', (v) => !!v);
+  bind('#style-outline-width', 'outlineWidth', (v) => Number(v), '#outline-width-val');
+  bind('#style-outline-color', 'outlineColor');
   bind('#style-padding', 'padding', (v) => Number(v), '#padding-val');
 }
 
@@ -644,13 +905,30 @@ function syncControlsFromState() {
   $('#line-height-val').textContent = s.lineHeight;
   $('#style-color').value = s.color;
   $('#style-weight').value = s.weight;
+  $('#style-letter-spacing').value = s.letterSpacing;
+  $('#letter-spacing-val').textContent = s.letterSpacing;
+  $('#style-word-spacing').value = s.wordSpacing;
+  $('#word-spacing-val').textContent = s.wordSpacing;
+  $('#style-blur').value = s.blur;
+  $('#blur-val').textContent = s.blur;
+  $('#style-hardedge').checked = s.hardEdge;
+  $('#style-case').value = s.textCase;
+  $('#style-italic').checked = s.italic;
   $('#style-bg-mode').value = s.bgMode;
   $('#style-bg-color').value = s.bgColor;
   $('#style-shadow').checked = s.shadow;
+  $('#style-outline-width').value = s.outlineWidth;
+  $('#outline-width-val').textContent = s.outlineWidth;
+  $('#style-outline-color').value = s.outlineColor;
   $('#style-padding').value = s.padding;
   $('#padding-val').textContent = s.padding;
   applyStyle();
   updateBgFieldVisibility();
+  updateOutlineVisibility();
+}
+
+function updateOutlineVisibility() {
+  $('#outline-settings').hidden = !state.style.shadow;
 }
 
 const PRESETS = {
@@ -705,6 +983,7 @@ async function loadProject() {
   if (Array.isArray(project.cues)) {
     state.cues = project.cues.map((c) => ({
       id: c.id || uid(), start: Number(c.start) || 0, end: Number(c.end) || 0, text: String(c.text || ''),
+      ...(Array.isArray(c.words) ? { words: c.words } : {}),
     }));
     sortCues();
   }
@@ -716,15 +995,6 @@ async function loadProject() {
   setStatus('Project loaded. Re-open the matching video if needed.', true);
 }
 
-function srtTimestamp(s) {
-  const ms = Math.round((s % 1) * 1000);
-  const total = Math.floor(s);
-  const hh = String(Math.floor(total / 3600)).padStart(2, '0');
-  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
-  const ss = String(total % 60).padStart(2, '0');
-  return `${hh}:${mm}:${ss},${String(ms).padStart(3, '0')}`;
-}
-
 async function exportSrt() {
   if (state.cues.length === 0) { setStatus('No cues to export.', true); return; }
   sortCues();
@@ -732,22 +1002,6 @@ async function exportSrt() {
     `${i + 1}\n${srtTimestamp(cue.start)} --> ${srtTimestamp(cue.end)}\n${cue.text}\n`);
   const res = await window.api.exportSrt(lines.join('\n'));
   if (res.ok) setStatus(`Exported subtitles to ${res.path}`, true);
-}
-
-function parseSrt(text) {
-  const cues = [];
-  const tc = /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})/;
-  for (const block of text.replace(/\r/g, '').split(/\n\n+/)) {
-    const ls = block.split('\n');
-    const idx = ls.findIndex((l) => tc.test(l));
-    if (idx === -1) continue;
-    const m = ls[idx].match(tc);
-    const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
-    const end = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
-    const body = ls.slice(idx + 1).join('\n').trim();
-    if (body) cues.push({ id: uid(), start: round2(start), end: round2(end), text: body });
-  }
-  return cues;
 }
 
 async function importSrt() {
@@ -828,7 +1082,7 @@ async function decodeAudioTo16kMono(arrayBuffer) {
   } finally {
     tmpCtx.close();
   }
-  const frames = Math.ceil(decoded.duration * 16000);
+  const frames = Math.max(1, Math.ceil(decoded.duration * 16000));
   const offline = new OfflineAudioContext(1, frames, 16000);
   const src = offline.createBufferSource();
   src.buffer = decoded;
@@ -838,17 +1092,34 @@ async function decodeAudioTo16kMono(arrayBuffer) {
   return rendered.getChannelData(0);
 }
 
+let transcribeReject = null;
+
+function fmtBytes(n) {
+  if (!n || n < 0) return '0 MB';
+  const mb = n / (1024 * 1024);
+  return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB';
+}
+
 function runTranscription(worker, payload, transfer) {
   return new Promise((resolve, reject) => {
+    transcribeReject = reject;
+    // Aggregate byte counts across the model's many files for one overall bar.
+    const dl = new Map();
     const onMsg = (e) => {
       const m = e.data;
       if (m.type === 'progress' && m.data) {
         const p = m.data;
-        if (p.status === 'progress' && p.file) {
-          setProgress(p.progress || 0, `Downloading model · ${p.file}`);
-        } else if (p.status === 'done') {
-          setProgress(100, 'Model ready');
+        if (p.status === 'progress' && p.file && p.total) {
+          dl.set(p.file, { loaded: p.loaded || 0, total: p.total });
+          let loaded = 0, total = 0;
+          for (const v of dl.values()) { loaded += v.loaded; total += v.total; }
+          const pct = total ? (loaded / total) * 100 : 0;
+          setProgress(pct, `Downloading model · ${fmtBytes(loaded)} / ${fmtBytes(total)}`);
+        } else if (p.status === 'done' && p.file && dl.has(p.file)) {
+          const v = dl.get(p.file); v.loaded = v.total; // count finished files in full
         }
+      } else if (m.type === 'transcribe-progress') {
+        setProgress(m.progress, `Transcribing audio · segment ${m.processed} of ${m.total}`);
       } else if (m.type === 'status') {
         setProgress(null, m.message);
       } else if (m.type === 'info') {
@@ -861,6 +1132,7 @@ function runTranscription(worker, payload, transfer) {
     };
     const onErr = () => { cleanup(); reject(new Error('Worker failed to load — check your internet connection.')); };
     const cleanup = () => {
+      transcribeReject = null;
       worker.removeEventListener('message', onMsg);
       worker.removeEventListener('error', onErr);
     };
@@ -870,34 +1142,18 @@ function runTranscription(worker, payload, transfer) {
   });
 }
 
-// Merge Whisper's timestamped chunks into nicely sized, readable cues.
-function assembleCues(chunks) {
-  const segs = chunks
-    .map((c) => ({ text: (c.text || '').trim(), s: c.timestamp && c.timestamp[0], e: c.timestamp && c.timestamp[1] }))
-    .filter((c) => c.text && c.s != null);
-
-  const out = [];
-  let cur = null;
-  const MAX_CHARS = 84, MAX_DUR = 6, GAP = 0.8;
-
-  for (const seg of segs) {
-    const end = seg.e != null && seg.e > seg.s ? seg.e : seg.s + 1.5;
-    if (!cur) {
-      cur = { s: seg.s, e: end, text: seg.text };
-    } else {
-      const merged = (cur.text + ' ' + seg.text).replace(/\s+/g, ' ').trim();
-      const gap = seg.s - cur.e;
-      if (merged.length <= MAX_CHARS && end - cur.s <= MAX_DUR && gap <= GAP) {
-        cur.text = merged; cur.e = end;
-      } else {
-        out.push(cur); cur = { s: seg.s, e: end, text: seg.text };
-      }
-    }
-    if (cur && /[.!?…]["')]?$/.test(cur.text) && cur.text.length > 40) { out.push(cur); cur = null; }
-  }
-  if (cur) out.push(cur);
-
-  return out.map((c) => ({ id: uid(), start: round2(Math.max(0, c.s)), end: round2(c.e), text: c.text }));
+// Build a predicate that reports whether a string fits the caption box at the
+// current font/size, using the same wrapping math as the renderer module.
+function makeFitsFn() {
+  const r = getVideoRect();
+  const s = state.style, b = state.box;
+  const o = {
+    w: b.w * r.width, h: b.h * r.height, pad: s.padding,
+    font: s.font, weight: s.weight, fontSize: s.fontSize, lineHeight: s.fontSize * s.lineHeight,
+    italic: s.italic, letterSpacing: s.letterSpacing, wordSpacing: s.wordSpacing, textCase: s.textCase,
+  };
+  const ctx = document.createElement('canvas').getContext('2d');
+  return (text) => CaptionRender.fits(ctx, text, o);
 }
 
 async function autoCaption() {
@@ -914,6 +1170,9 @@ async function autoCaption() {
   showProgress('Auto-captioning', true);
   onCancel = () => {
     cancelled = true;
+    // Settle any in-flight transcription so its await unblocks; terminating the
+    // worker alone would leave the promise pending and the button stuck disabled.
+    if (transcribeReject) transcribeReject(new Error('cancelled'));
     if (transcribeWorker) { transcribeWorker.terminate(); transcribeWorker = null; }
     hideProgress();
     setStatus('Auto-caption cancelled.', true);
@@ -930,13 +1189,30 @@ async function autoCaption() {
 
     const { model, language, task } = resolveModel();
     setProgress(null, 'Loading model (first run downloads it)…');
-    const worker = getTranscribeWorker();
-    const result = await runTranscription(
-      worker, { type: 'transcribe', model, language, task, audio }, [audio.buffer],
-    );
+
+    // Don't transfer the audio buffer — we keep it so a failed GPU attempt can
+    // be retried on CPU. (A failed WebGPU init poisons the worker's runtime, so
+    // recovery requires a fresh worker.)
+    const send = (force) =>
+      runTranscription(getTranscribeWorker(), { type: 'transcribe', model, language, task, audio, force }, []);
+
+    let result;
+    try {
+      result = await send(null);
+    } catch (err) {
+      if (cancelled) return;
+      console.warn('Transcription failed; recreating worker and retrying on CPU.', err);
+      if (transcribeWorker) { transcribeWorker.terminate(); transcribeWorker = null; }
+      setProgress(null, 'Retrying transcription on CPU…');
+      result = await send({ device: 'wasm', dtype: 'q8' });
+    }
     if (cancelled) return;
 
-    const cues = assembleCues(result.chunks);
+    // Interpolate per-word timings from Whisper's segment timestamps, then chunk
+    // into box-fitting cues that carry those timings for the reveal effect.
+    const words = wordsFromSegments(result.chunks || []);
+    let cues = assembleWordCues(words, makeFitsFn(), { maxDur: 7, gap: 0.8 });
+    if (!cues.length) cues = assembleCues(result.chunks);
     if (!cues.length) { setStatus('No speech detected in the audio.', true); return; }
     state.cues = cues;
     sortCues();
@@ -947,7 +1223,7 @@ async function autoCaption() {
   } catch (err) {
     if (!cancelled) {
       console.error(err);
-      setStatus('Auto-caption failed: ' + ((err && err.message) || err), true);
+      setError('Auto-caption failed: ' + ((err && err.message) || err));
     }
   } finally {
     autoCaptioning = false;
@@ -960,95 +1236,31 @@ async function autoCaption() {
 // Canvas caption rendering (frame + video export)
 // ---------------------------------------------------------------------------
 
-function layoutLines(ctx, text, maxWidth) {
-  const lines = [];
-  for (const paragraph of text.split('\n')) {
-    const words = paragraph.split(/\s+/).filter(Boolean);
-    if (words.length === 0) { lines.push({ words: [], paraEnd: true }); continue; }
-    let current = [];
-    for (const word of words) {
-      const candidate = current.concat(word).join(' ');
-      if (current.length && ctx.measureText(candidate).width > maxWidth) {
-        lines.push({ words: current, paraEnd: false });
-        current = [word];
-      } else current.push(word);
-    }
-    lines.push({ words: current, paraEnd: true });
-  }
-  return lines;
-}
-
-function drawCaption(ctx, canvasW, canvasH, text) {
-  if (!text) return;
+// Draw a cue onto an export-sized canvas using the shared render module, so the
+// burned-in video matches the preview exactly. The box's on-screen font/padding
+// are scaled up to the export resolution.
+function drawCueToCanvas(ctx, canvasW, canvasH, cue, atTime, rect) {
+  if (!cue) return;
   const s = state.style, b = state.box;
-  const boxX = b.x * canvasW, boxY = b.y * canvasH, boxW = b.w * canvasW, boxH = b.h * canvasH;
-
-  const r = getVideoRect();
+  // `rect` is the video content rectangle; callers in a per-frame loop pass it
+  // in (it's constant during export) so we don't force a reflow every frame.
+  const r = rect || getVideoRect();
   const scale = r.width ? canvasW / r.width : 1;
-  const fontSize = s.fontSize * scale;
-  const pad = s.padding * scale;
-  const lineHeight = fontSize * s.lineHeight;
-
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(boxX, boxY, boxW, boxH);
-  ctx.clip();
-
-  ctx.font = `${s.weight} ${fontSize}px ${s.font}`;
-  ctx.textBaseline = 'top';
-
-  if (s.bgMode !== 'none') {
-    ctx.fillStyle = s.bgMode === 'translucent' ? hexToRgba(s.bgColor, 0.72) : s.bgColor;
-    ctx.fillRect(boxX, boxY, boxW, boxH);
-  }
-
-  const textLeft = boxX + pad;
-  const contentW = boxW - pad * 2;
-  const lines = layoutLines(ctx, text, contentW);
-  const blockH = lines.length * lineHeight;
-
-  let textY;
-  if (s.valign === 'top') textY = boxY + pad;
-  else if (s.valign === 'bottom') textY = boxY + boxH - pad - blockH;
-  else textY = boxY + (boxH - blockH) / 2;
-
-  ctx.fillStyle = s.color;
-  lines.forEach((line, i) => drawLine(ctx, line, textLeft, textY + i * lineHeight, contentW, fontSize, s));
-  ctx.restore();
-}
-
-function drawLine(ctx, line, left, y, contentW, fontSize, s) {
-  const words = line.words;
-  if (words.length === 0) return;
-
-  if (s.shadow) {
-    ctx.shadowColor = 'rgba(0,0,0,0.6)';
-    ctx.shadowBlur = fontSize * 0.12;
-    ctx.shadowOffsetY = fontSize * 0.04;
-  } else {
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    ctx.shadowOffsetY = 0;
-  }
-
-  const joined = words.join(' ');
-  const naturalW = ctx.measureText(joined).width;
-  const justifyThisLine = s.align === 'justify' && words.length > 1 && (!line.paraEnd || s.justifyLast);
-
-  if (justifyThisLine) {
-    const wordsW = words.reduce((sum, w) => sum + ctx.measureText(w).width, 0);
-    const gap = (contentW - wordsW) / (words.length - 1);
-    let x = left;
-    for (const word of words) {
-      ctx.fillText(word, x, y);
-      x += ctx.measureText(word).width + gap;
-    }
-  } else {
-    let x = left;
-    if (s.align === 'center') x = left + (contentW - naturalW) / 2;
-    else if (s.align === 'right') x = left + (contentW - naturalW);
-    ctx.fillText(joined, x, y);
-  }
+  const hasWords = cue.words && cue.words.length;
+  CaptionRender.drawCaption(ctx, {
+    x: b.x * canvasW, y: b.y * canvasH, w: b.w * canvasW, h: b.h * canvasH,
+    pad: s.padding * scale,
+    font: s.font, weight: s.weight, fontSize: s.fontSize * scale,
+    lineHeight: s.fontSize * scale * s.lineHeight,
+    italic: s.italic, letterSpacing: s.letterSpacing * scale, wordSpacing: s.wordSpacing * scale, textCase: s.textCase,
+    blur: s.blur * scale, hardEdge: s.hardEdge,
+    color: s.color, align: s.align, justifyLast: s.justifyLast, valign: s.valign,
+    bgMode: s.bgMode, bgColor: s.bgColor,
+    outline: s.shadow, outlineWidth: s.outlineWidth * scale, outlineColor: s.outlineColor,
+    text: hasWords ? undefined : cue.text,
+    words: hasWords ? cue.words : undefined,
+    atTime,
+  });
 }
 
 async function exportFrame() {
@@ -1058,8 +1270,7 @@ async function exportFrame() {
   canvas.height = video.videoHeight;
   const ctx = canvas.getContext('2d');
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const cue = activeCueAt(video.currentTime);
-  if (cue) drawCaption(ctx, canvas.width, canvas.height, cue.text);
+  drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(video.currentTime), video.currentTime, getVideoRect());
   const res = await window.api.exportFrame(canvas.toDataURL('image/png'));
   if (res.ok) setStatus(`Saved frame to ${res.path}`, true);
 }
@@ -1083,7 +1294,14 @@ async function exportVideo() {
   canvas.height = video.videoHeight;
   const ctx = canvas.getContext('2d');
 
-  const canvasStream = canvas.captureStream(30);
+  // The video content rectangle is constant for the whole export — measure it
+  // once instead of forcing a reflow (getBoundingClientRect) on every frame.
+  const exportRect = getVideoRect();
+
+  // Capture at the source's frame rate so 24/60fps clips aren't resampled to 30.
+  setProgress(null, 'Detecting frame rate…');
+  const fps = await detectFrameRate(state.videoUrl);
+  const canvasStream = canvas.captureStream(fps);
   let audioTracks = [];
   try {
     const audioStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
@@ -1100,22 +1318,37 @@ async function exportVideo() {
   let rafId = 0;
   const renderLoop = () => {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const cue = activeCueAt(video.currentTime);
-    if (cue) drawCaption(ctx, canvas.width, canvas.height, cue.text);
+    drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(video.currentTime), video.currentTime, exportRect);
     const pct = video.duration ? (video.currentTime / video.duration) * 100 : 0;
     setProgress(pct, `Recording · ${fmtTime(video.currentTime)} / ${fmtTime(video.duration)}`);
     rafId = requestAnimationFrame(renderLoop);
   };
 
   let finished = false;
+  let started = false;
+  let cancelled = false;
   const finish = async () => {
     if (finished) return;
     finished = true;
     cancelAnimationFrame(rafId);
     video.removeEventListener('ended', onEnded);
-    if (recorder.state !== 'inactive') recorder.stop();
-    await done;
+    video.pause();
+
+    // Only await the recorder's stop if it actually started; otherwise `done`
+    // never resolves (the cancel-during-initial-seek case) and we'd hang here.
+    if (started && recorder.state !== 'inactive') {
+      recorder.stop();
+      await done;
+    }
     audioTracks.forEach((t) => t.stop());
+
+    if (cancelled || !started) {
+      exporting = false;
+      hideProgress();
+      setStatus('Export cancelled.', true);
+      if (!wasPaused) video.play();
+      return;
+    }
 
     setProgress(null, 'Encoding to MP4…');
     const blob = new Blob(chunks, { type: mime });
@@ -1125,7 +1358,7 @@ async function exportVideo() {
     exporting = false;
     hideProgress();
     if (res.ok) setStatus(`Exported video to ${res.path}${res.transcoded ? ' (MP4)' : ''}`, true);
-    else if (res.error) setStatus('Export failed — see error dialog.', true);
+    else if (res.error) setError('Export failed — see error dialog.');
     else setStatus('Export cancelled.', true);
     if (!wasPaused) video.play();
   };
@@ -1133,18 +1366,56 @@ async function exportVideo() {
   const onEnded = () => finish();
 
   showProgress('Exporting captioned video', true);
-  onCancel = () => finish();
+  onCancel = () => { cancelled = true; finish(); };
 
   video.currentTime = 0;
   await new Promise((r) => {
     const handler = () => { video.removeEventListener('seeked', handler); r(); };
     video.addEventListener('seeked', handler);
   });
+  if (cancelled) return; // bailed out during the initial seek
 
   recorder.start();
+  started = true;
   renderLoop();
   video.addEventListener('ended', onEnded);
   video.play();
+}
+
+// Estimate a video's frame rate from the media timestamps of its first few
+// presented frames (via requestVideoFrameCallback), so export captures at the
+// source rate rather than a hardcoded 30fps. Probes on a throwaway off-screen
+// element to avoid disturbing the main player; falls back to 30 when rVFC is
+// unavailable or the probe can't gather enough samples.
+function detectFrameRate(url) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    if (!url || typeof v.requestVideoFrameCallback !== 'function') { resolve(30); return; }
+    v.muted = true;
+    const samples = [];
+    let rafId = 0, settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try { v.cancelVideoFrameCallback(rafId); } catch (_) {}
+      v.pause(); v.removeAttribute('src'); v.load();
+      const deltas = [];
+      for (let i = 1; i < samples.length; i++) { const d = samples[i] - samples[i - 1]; if (d > 0) deltas.push(d); }
+      if (deltas.length < 2) { resolve(30); return; }
+      deltas.sort((a, b) => a - b);
+      const median = deltas[Math.floor(deltas.length / 2)];
+      resolve(median > 0 ? clamp(Math.round(1 / median), 1, 120) : 30);
+    };
+    const onFrame = (_now, meta) => {
+      samples.push(meta.mediaTime);
+      if (samples.length >= 8) { finish(); return; }
+      rafId = v.requestVideoFrameCallback(onFrame);
+    };
+    v.addEventListener('loadeddata', () => { rafId = v.requestVideoFrameCallback(onFrame); v.play().catch(finish); }, { once: true });
+    v.addEventListener('error', finish, { once: true });
+    setTimeout(finish, 1500); // safety net for stalls
+    v.src = url;
+  });
 }
 
 function pickMime() {
@@ -1186,7 +1457,7 @@ function loadDroppedFile(file) {
   } else if (ext === 'srt') {
     file.text().then((t) => applyImportedCues(parseSrt(t), file.name));
   } else {
-    setStatus('Unsupported file type.', true);
+    setError('Unsupported file type.');
   }
 }
 
@@ -1226,6 +1497,29 @@ function applyPendingAuto() {
 function openModal(id) { $(id).hidden = false; }
 function closeModal(id) { $(id).hidden = true; }
 
+// Toolbar dropdown menus: trigger toggles its panel; outside-click / Escape /
+// selecting a menu item closes. Form panels (auto-caption options) stay open
+// while interacting with their controls.
+function setupMenus() {
+  const menus = Array.from(document.querySelectorAll('[data-menu]'));
+  const closeAll = () => menus.forEach((m) => m.classList.remove('open'));
+  for (const menu of menus) {
+    const trigger = menu.querySelector('.menu-trigger');
+    trigger.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = menu.classList.contains('open');
+      closeAll();
+      if (!wasOpen) menu.classList.add('open');
+    });
+    const panel = menu.querySelector('.menu-panel');
+    if (panel) panel.addEventListener('click', (e) => e.stopPropagation());
+    menu.querySelectorAll('.menu-item').forEach((item) =>
+      item.addEventListener('click', () => menu.classList.remove('open')));
+  }
+  document.addEventListener('click', closeAll);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAll(); });
+}
+
 function wireUI() {
   $('#btn-open').addEventListener('click', openVideo);
   $('#btn-open-2').addEventListener('click', openVideo);
@@ -1245,10 +1539,11 @@ function wireUI() {
   $('#help-close').addEventListener('click', () => closeModal('#help-modal'));
   $('#help-modal').addEventListener('click', (e) => { if (e.target.id === 'help-modal') closeModal('#help-modal'); });
 
-  document.querySelectorAll('[data-preset]').forEach((btn) => {
-    btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
+  $('#style-preset').addEventListener('change', (e) => {
+    if (e.target.value) applyPreset(e.target.value);
   });
 
+  setupMenus();
   bindStyleControls();
   buildSwatches();
   buildLangSelect();
@@ -1265,6 +1560,11 @@ function wireUI() {
       if (e.shiftKey) redo(); else undo();
       return;
     }
+    if (e.key === 'Escape' && !$('#help-modal').hidden) {
+      e.preventDefault();
+      closeModal('#help-modal');
+      return;
+    }
     if (typing) return;
     if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
     else if (e.key === ',') stepFrame(-1);
@@ -1278,6 +1578,7 @@ function wireUI() {
   window.api.onMenu('menu:export-srt', exportSrt);
   window.api.onMenu('menu:export-video', exportVideo);
   window.api.onMenu('menu:add-cue', addCueAtPlayhead);
+  window.api.onMenu('menu:split-all-to-fit', splitAllCuesToFit);
   window.api.onMenu('menu:auto-caption', autoCaption);
   window.api.onMenu('menu:toggle-play', togglePlay);
   window.api.onMenu('menu:undo', undo);

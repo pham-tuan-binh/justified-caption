@@ -5,7 +5,10 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --dev"
+    "dev": "electron . --dev",
+    "test": "node --test test/*.test.js",
+    "test:download": "electron tools/download-harness.js",
+    "test:visual": "electron tools/visual-test.js"
   },
   "keywords": [
     "electron",
@@ -21,5 +24,11 @@
   },
   "dependencies": {
     "ffmpeg-static": "^5.3.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "ffmpeg-static"
+    ]
   }
 }
