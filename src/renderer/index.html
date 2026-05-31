@@ -273,6 +273,26 @@
         </details>
 
         <details class="section">
+          <summary>Animation</summary>
+          <div class="section-body">
+            <p class="muted-note">Per-word reveal as each word's timestamp arrives. Needs per-word timings (from auto-caption, or synthesized for imported/edited cues).</p>
+            <label class="field">
+              <span>Reveal speed <em id="reveal-val">0.32</em><i>s</i></span>
+              <input type="range" id="style-reveal" min="0" max="100" step="2" value="32" />
+            </label>
+            <p class="muted-note">0 = off (words appear instantly).</p>
+            <label class="field">
+              <span>Rise distance <em id="reveal-rise-val">50</em><i>%</i></span>
+              <input type="range" id="style-reveal-rise" min="0" max="150" step="5" value="50" />
+            </label>
+            <label class="field">
+              <span>Blur amount <em id="reveal-blur-val">18</em><i>%</i></span>
+              <input type="range" id="style-reveal-blur" min="0" max="60" step="2" value="18" />
+            </label>
+          </div>
+        </details>
+
+        <details class="section">
           <summary>Background</summary>
           <div class="section-body">
             <label class="field">

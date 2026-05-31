@@ -39,6 +39,11 @@ const state = {
     outlineWidth: 2,
     outlineColor: '#000000',
     padding: 8,
+    // Per-word reveal animation (blur slide-up). reveal = duration in seconds
+    // (0 = off / hard cut); revealRise/revealBlur are fractions of fontSize.
+    reveal: 0.32,
+    revealRise: 0.5,
+    revealBlur: 0.18,
   },
 };
 
@@ -408,7 +413,7 @@ function renderCaptionCanvas() {
   const cue = activeCueAt(video.currentTime);
   if (!cue) { container.classList.remove('overflowing'); return; }
   const s = state.style;
-  const hasWords = cue.words && cue.words.length;
+  const revealWords = wordsForCue(cue);
   const res = CaptionRender.drawCaption(ctx, {
     x: 0, y: 0, w: cssW, h: cssH, pad: s.padding,
     font: s.font, weight: s.weight, fontSize: s.fontSize, lineHeight: s.fontSize * s.lineHeight,
@@ -417,9 +422,10 @@ function renderCaptionCanvas() {
     color: s.color, align: s.align, justifyLast: s.justifyLast, valign: s.valign,
     bgMode: s.bgMode, bgColor: s.bgColor,
     outline: s.shadow, outlineWidth: s.outlineWidth, outlineColor: s.outlineColor,
-    text: hasWords ? undefined : cue.text,
-    words: hasWords ? cue.words : undefined,
+    text: revealWords.length ? undefined : cue.text,
+    words: revealWords.length ? revealWords : undefined,
     atTime: video.currentTime,
+    reveal: s.reveal, revealRise: s.revealRise, revealBlur: s.revealBlur,
   });
   container.classList.toggle('overflowing', !!res.overflow);
 }
@@ -835,19 +841,20 @@ function applyStyle() {
 }
 
 function bindStyleControls() {
-  const bind = (sel, key, transform = (v) => v, label) => {
+  const bind = (sel, key, transform = (v) => v, label, fmt) => {
     const el = $(sel);
     const type = el.type;
     const event = type === 'range' || type === 'color' ? 'input' : 'change';
     el.addEventListener(event, () => {
       const raw = type === 'checkbox' ? el.checked : el.value;
       state.style[key] = transform(raw);
-      if (label) $(label).textContent = state.style[key];
+      if (label) $(label).textContent = fmt ? fmt(state.style[key]) : state.style[key];
       applyStyle();
       updateBgFieldVisibility();
       recordHistory();
     });
   };
+  const pct = (v) => Math.round(v * 100);
 
   bind('#style-align', 'align');
   bind('#style-justify-last', 'justifyLast', (v) => !!v);
@@ -869,6 +876,9 @@ function bindStyleControls() {
   bind('#style-outline-width', 'outlineWidth', (v) => Number(v), '#outline-width-val');
   bind('#style-outline-color', 'outlineColor');
   bind('#style-padding', 'padding', (v) => Number(v), '#padding-val');
+  bind('#style-reveal', 'reveal', (v) => Number(v) / 100, '#reveal-val');
+  bind('#style-reveal-rise', 'revealRise', (v) => Number(v) / 100, '#reveal-rise-val', pct);
+  bind('#style-reveal-blur', 'revealBlur', (v) => Number(v) / 100, '#reveal-blur-val', pct);
 }
 
 function buildSwatches() {
@@ -922,6 +932,12 @@ function syncControlsFromState() {
   $('#style-outline-color').value = s.outlineColor;
   $('#style-padding').value = s.padding;
   $('#padding-val').textContent = s.padding;
+  $('#style-reveal').value = Math.round(s.reveal * 100);
+  $('#reveal-val').textContent = s.reveal;
+  $('#style-reveal-rise').value = Math.round(s.revealRise * 100);
+  $('#reveal-rise-val').textContent = Math.round(s.revealRise * 100);
+  $('#style-reveal-blur').value = Math.round(s.revealBlur * 100);
+  $('#reveal-blur-val').textContent = Math.round(s.revealBlur * 100);
   applyStyle();
   updateBgFieldVisibility();
   updateOutlineVisibility();
@@ -1246,7 +1262,7 @@ function drawCueToCanvas(ctx, canvasW, canvasH, cue, atTime, rect) {
   // in (it's constant during export) so we don't force a reflow every frame.
   const r = rect || getVideoRect();
   const scale = r.width ? canvasW / r.width : 1;
-  const hasWords = cue.words && cue.words.length;
+  const revealWords = wordsForCue(cue);
   CaptionRender.drawCaption(ctx, {
     x: b.x * canvasW, y: b.y * canvasH, w: b.w * canvasW, h: b.h * canvasH,
     pad: s.padding * scale,
@@ -1257,9 +1273,10 @@ function drawCueToCanvas(ctx, canvasW, canvasH, cue, atTime, rect) {
     color: s.color, align: s.align, justifyLast: s.justifyLast, valign: s.valign,
     bgMode: s.bgMode, bgColor: s.bgColor,
     outline: s.shadow, outlineWidth: s.outlineWidth * scale, outlineColor: s.outlineColor,
-    text: hasWords ? undefined : cue.text,
-    words: hasWords ? cue.words : undefined,
+    text: revealWords.length ? undefined : cue.text,
+    words: revealWords.length ? revealWords : undefined,
     atTime,
+    reveal: s.reveal, revealRise: s.revealRise, revealBlur: s.revealBlur,
   });
 }
 
@@ -1283,6 +1300,126 @@ let exporting = false;
 
 async function exportVideo() {
   if (!state.videoUrl) { setStatus('Open a video first.', true); return; }
+  if (exporting) return;
+  // Offline pipeline (frame-by-frame → bundled ffmpeg) is faster than real-time
+  // and crisper (no lossy MediaRecorder step). It needs the source file on disk
+  // for the audio track; without a path we fall back to the real-time capture.
+  if (state.videoPath) {
+    const ok = await exportVideoOffline();
+    if (ok !== 'unsupported') return; // 'unsupported' = ffmpeg missing → fall back
+  }
+  return exportVideoRealtime();
+}
+
+// Offline export: seek the video frame-by-frame, composite each frame on a
+// canvas, and stream the PNGs into ffmpeg (which muxes the original audio and
+// encodes a single time). Returns 'unsupported' if the main process reports no
+// ffmpeg, so the caller can fall back to the real-time MediaRecorder path.
+async function exportVideoOffline() {
+  exporting = true;
+  const wasPaused = video.paused;
+  const resumeAt = video.currentTime;
+  video.pause();
+
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext('2d');
+  const exportRect = getVideoRect();
+
+  showProgress('Exporting captioned video', true);
+  setProgress(null, 'Detecting frame rate…');
+  const fps = await detectFrameRate(state.videoUrl);
+  const duration = video.duration || 0;
+  const totalFrames = Math.max(1, Math.round(duration * fps));
+
+  const begin = await window.api.beginExport({
+    width: canvas.width, height: canvas.height, fps, audioPath: state.videoPath,
+  });
+  if (!begin.ok) {
+    exporting = false;
+    hideProgress();
+    if (begin.canceled) { setStatus('Export cancelled.', true); if (!wasPaused) video.play(); return; }
+    return 'unsupported'; // ffmpeg unavailable — let the caller fall back
+  }
+  const sessionId = begin.sessionId;
+
+  let cancelled = false;
+  onCancel = () => { cancelled = true; };
+
+  // Seek to t and wait until the decoded frame is ready to composite. We resolve
+  // on 'seeked' (+ one rAF so the frame has settled); skip the wait when already
+  // parked on t, since 'seeked' wouldn't fire and we'd hang.
+  const seekTo = (t) => new Promise((resolve) => {
+    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; }
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); requestAnimationFrame(resolve); };
+    video.addEventListener('seeked', onSeeked);
+    video.currentTime = t;
+  });
+  const frameToPng = () => new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? b.arrayBuffer().then(resolve, reject) : reject(new Error('frame encode failed'))), 'image/png'));
+
+  const startedAt = performance.now();
+  try {
+    for (let i = 0; i < totalFrames; i++) {
+      if (cancelled) break;
+      const t = Math.min(i / fps, Math.max(0, duration - 1e-3));
+      await seekTo(t);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(t), t, exportRect);
+      const png = await frameToPng();
+      const res = await window.api.writeExportFrame({ sessionId, buffer: new Uint8Array(png) });
+      if (!res.ok) throw new Error(res.error || 'frame write failed');
+      if (i % 3 === 0 || i === totalFrames - 1) {
+        const done = i + 1;
+        // ETA from the rate achieved so far (frames/sec). Skip the first few
+        // frames while the seek pipeline warms up so the estimate isn't wild.
+        const elapsed = (performance.now() - startedAt) / 1000;
+        let eta = '';
+        if (done >= 4 && elapsed > 0) {
+          const remaining = (totalFrames - done) * (elapsed / done);
+          eta = ` · ~${fmtDuration(remaining)} left (${(done / elapsed).toFixed(1)} fps)`;
+        }
+        setProgress((done / totalFrames) * 100, `Rendering frame ${done} / ${totalFrames}${eta}`);
+      }
+    }
+  } catch (err) {
+    await window.api.endExport({ sessionId, cancel: true });
+    exporting = false; onCancel = null; hideProgress();
+    setError('Export failed: ' + ((err && err.message) || err));
+    if (!wasPaused) video.play();
+    return;
+  }
+
+  if (cancelled) {
+    await window.api.endExport({ sessionId, cancel: true });
+    exporting = false; onCancel = null; hideProgress();
+    setStatus('Export cancelled.', true);
+    video.currentTime = resumeAt;
+    if (!wasPaused) video.play();
+    return;
+  }
+
+  setProgress(null, 'Encoding to MP4…');
+  const res = await window.api.endExport({ sessionId, cancel: false });
+  exporting = false; onCancel = null; hideProgress();
+  if (res.ok) setStatus(`Exported video to ${res.path}`, true);
+  else if (res.canceled) setStatus('Export cancelled.', true);
+  else setError('Export failed — see error dialog.');
+  video.currentTime = resumeAt;
+  if (!wasPaused) video.play();
+}
+
+// Coarse human-readable duration for the export ETA ("45s", "1m 20s", "1h 3m").
+function fmtDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+async function exportVideoRealtime() {
   if (exporting) return;
   exporting = true;
 
@@ -1310,7 +1447,12 @@ async function exportVideo() {
   } catch (_) {}
 
   const mime = pickMime();
-  const recorder = new MediaRecorder(canvasStream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+  // MediaRecorder is a *lossy intermediate* before ffmpeg transcodes to MP4, so
+  // a flat 8 Mbps visibly softens sharp caption text (and the reveal motion eats
+  // bitrate). Scale to resolution·fps (~0.15 bits/pixel) so detail survives the
+  // round-trip; the live preview looks crisper because it isn't encoded at all.
+  const bitrate = clamp(Math.round(canvas.width * canvas.height * fps * 0.15), 8_000_000, 80_000_000);
+  const recorder = new MediaRecorder(canvasStream, { mimeType: mime, videoBitsPerSecond: bitrate });
   const chunks = [];
   recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   const done = new Promise((resolve) => (recorder.onstop = resolve));

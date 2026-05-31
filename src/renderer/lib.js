@@ -83,9 +83,25 @@
     return out.map((c) => ({ id: uid(), start: round2(Math.max(0, c.s)), end: round2(c.e), text: c.text }));
   }
 
-  // Expand Whisper's segment-level timestamps into per-word timings by spreading
-  // each segment's [start,end] across its words in proportion to word length.
-  // Approximate (not true forced alignment) but enough to reveal words in sync.
+  // Spread a [start,end] span across `text`'s words in proportion to word
+  // length, yielding approximate per-word timings. Not true forced alignment,
+  // but enough to drive the word-by-word reveal in sync.
+  function spreadWords(text, s, e) {
+    const toks = String(text || '').split(/\s+/).filter(Boolean);
+    if (!toks.length) return [];
+    const totalChars = toks.reduce((n, t) => n + t.length, 0) || 1;
+    const out = [];
+    let acc = 0;
+    for (const tok of toks) {
+      const start = s + (acc / totalChars) * (e - s);
+      acc += tok.length;
+      const end = s + (acc / totalChars) * (e - s);
+      out.push({ text: tok, start, end });
+    }
+    return out;
+  }
+
+  // Expand Whisper's segment-level timestamps into per-word timings.
   function wordsFromSegments(segments) {
     const out = [];
     for (const seg of segments || []) {
@@ -94,17 +110,18 @@
       let e = seg.e != null ? seg.e : (seg.timestamp && seg.timestamp[1]);
       if (!text || s == null) continue;
       if (e == null || e <= s) e = s + Math.max(0.4, text.length * 0.06);
-      const toks = text.split(/\s+/).filter(Boolean);
-      const totalChars = toks.reduce((n, t) => n + t.length, 0) || 1;
-      let acc = 0;
-      for (const tok of toks) {
-        const start = s + (acc / totalChars) * (e - s);
-        acc += tok.length;
-        const end = s + (acc / totalChars) * (e - s);
-        out.push({ text: tok, start, end });
-      }
+      out.push(...spreadWords(text, s, e));
     }
     return out;
+  }
+
+  // Per-word timings for a cue's reveal. Uses the cue's stored `words` when it
+  // has them (real Whisper timings); otherwise synthesizes them from the cue's
+  // [start,end] span so imported / typed / edited cues still reveal word-by-word.
+  function wordsForCue(cue) {
+    if (cue && cue.words && cue.words.length) return cue.words;
+    if (!cue) return [];
+    return spreadWords(cue.text, Number(cue.start) || 0, Number(cue.end) || 0);
   }
 
   // Group word-level timestamps into cues that (a) fit the caption box and
@@ -224,7 +241,7 @@
     return lines;
   }
 
-  const api = { uid, clamp, round2, fmtTime, hexToRgba, srtTimestamp, parseSrt, assembleCues, assembleWordCues, wordsFromSegments, splitToFit, layoutLines };
+  const api = { uid, clamp, round2, fmtTime, hexToRgba, srtTimestamp, parseSrt, assembleCues, assembleWordCues, spreadWords, wordsFromSegments, wordsForCue, splitToFit, layoutLines };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   // Expose as globals for the renderer's plain-script environment.
   if (root) for (const k in api) root[k] = api[k];

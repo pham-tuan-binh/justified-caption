@@ -6,7 +6,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  clamp, round2, fmtTime, hexToRgba, srtTimestamp, parseSrt, assembleCues, assembleWordCues, wordsFromSegments, splitToFit, layoutLines,
+  clamp, round2, fmtTime, hexToRgba, srtTimestamp, parseSrt, assembleCues, assembleWordCues, wordsFromSegments, wordsForCue, splitToFit, layoutLines,
 } = require('../src/renderer/lib.js');
 
 test('clamp keeps values inside the range', () => {
@@ -139,6 +139,20 @@ test('wordsFromSegments synthesizes an end when the segment has none', () => {
   const words = wordsFromSegments([{ text: 'hi', s: 5, e: null }]);
   assert.equal(words.length, 1);
   assert.ok(words[0].end > words[0].start);
+});
+
+test('wordsForCue keeps a cue\'s real per-word timings when present', () => {
+  const cue = { start: 0, end: 3, text: 'a b', words: [{ text: 'a', start: 0.1, end: 0.2 }] };
+  assert.equal(wordsForCue(cue), cue.words);
+});
+
+test('wordsForCue synthesizes word timings across [start,end] when absent', () => {
+  const cue = { start: 0, end: 4, text: 'one two three four' };
+  const words = wordsForCue(cue);
+  assert.deepEqual(words.map((x) => x.text), ['one', 'two', 'three', 'four']);
+  assert.equal(words[0].start, 0);            // first word anchored at cue start
+  assert.equal(words[words.length - 1].end, 4); // last word ends at cue end
+  assert.ok(words.every((x, i) => i === 0 || x.start >= words[i - 1].start)); // ascending
 });
 
 const w = (text, start, end) => ({ text, start, end });

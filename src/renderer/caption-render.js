@@ -16,6 +16,12 @@
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
   }
 
+  // easeOutCubic — fast start, gentle settle. Drives the per-word reveal so the
+  // word covers most of its rise/sharpen early then eases into place. t in [0,1].
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+  }
+
   // Greedy word wrap to a pixel width. `ctx` only needs measureText().
   // Returns [{ words: string[], paraEnd: boolean }].
   function wrapLines(ctx, text, maxWidth) {
@@ -156,16 +162,24 @@
 
     const left = o.x + o.pad;
     const revealing = o.atTime != null && o.words && o.words.length;
+    // Per-word reveal: each word rises from below while sharpening from a blur
+    // and fading in. All knobs are tunable (and expressed relative to fontSize
+    // for rise/blur, so they scale with export resolution):
+    //   o.reveal     — duration in seconds (default 0.32; 0 = old hard cut)
+    //   o.revealRise — travel distance, as a fraction of fontSize (default 0.5)
+    //   o.revealBlur — max blur, as a fraction of fontSize (default 0.18)
+    // Only applies when revealing word-by-word.
+    const revealDur = o.reveal != null ? o.reveal : 0.32;
+    const risePx = (o.revealRise != null ? o.revealRise : 0.5) * o.fontSize;
+    const maxBlurPx = (o.revealBlur != null ? o.revealBlur : 0.18) * o.fontSize;
 
     // Optional blur. "Hard edges" pipes the blur through an alpha-threshold SVG
     // filter (the gooey / threshold look) so the soft blur snaps back to crisp
     // edges. ctx.filter is reset by the restore() at the end.
-    if (o.blur > 0 || o.hardEdge) {
-      const parts = [];
-      if (o.blur > 0) parts.push('blur(' + o.blur + 'px)');
-      if (o.hardEdge) parts.push('url(#cap-threshold)');
-      if (parts.length) ctx.filter = parts.join(' ');
-    }
+    const baseFilterParts = [];
+    if (o.blur > 0) baseFilterParts.push('blur(' + o.blur + 'px)');
+    if (o.hardEdge) baseFilterParts.push('url(#cap-threshold)');
+    if (baseFilterParts.length) ctx.filter = baseFilterParts.join(' ');
 
     // A true outline: stroke (rounded join) drawn under the fill. lineWidth is
     // doubled because half the centered stroke is hidden behind the glyph fill.
@@ -198,10 +212,37 @@
       }
 
       for (let k = 0; k < words.length; k++) {
-        if (revealing) { const wd = o.words[base + k]; if (wd && o.atTime < wd.start) continue; }
+        let dy = 0, alpha = 1, blurPx = 0;
+        if (revealing) {
+          const wd = o.words[base + k];
+          if (wd) {
+            if (o.atTime < wd.start) continue; // not yet — laid out but unpainted
+            if (revealDur > 0) {
+              const t = (o.atTime - wd.start) / revealDur;
+              if (t < 1) {
+                // Blur slide-up: word rises from below, sharpens, and fades in.
+                const e = easeOutCubic(t);
+                dy = risePx * (1 - e);            // start `risePx` low → 0
+                blurPx = maxBlurPx * (1 - e);     // soft → crisp
+                alpha = Math.min(1, t / 0.45);    // fade in over first 45%
+              }
+            }
+          }
+        }
         const x = startX + line.dx[k];
-        if (outline) ctx.strokeText(words[k], x, y);
-        ctx.fillText(words[k], x, y);
+        if (dy === 0 && alpha === 1 && blurPx === 0) {
+          if (outline) ctx.strokeText(words[k], x, y);
+          ctx.fillText(words[k], x, y);
+        } else {
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          if (blurPx > 0.05) {
+            ctx.filter = baseFilterParts.concat('blur(' + blurPx.toFixed(2) + 'px)').join(' ');
+          }
+          if (outline) ctx.strokeText(words[k], x, y + dy);
+          ctx.fillText(words[k], x, y + dy);
+          ctx.restore();
+        }
       }
     }
 

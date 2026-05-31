@@ -199,6 +199,96 @@ ipcMain.handle('export:video', async (_event, { buffer, recordedExt }) => {
   return { ok: true, path: target, transcoded: true };
 });
 
+// Offline video export: the renderer streams PNG frames in and ffmpeg encodes
+// them once (muxing the original file's audio). Faster than real-time capture
+// and lossless into the encoder, so caption text stays crisp. Sessions are
+// keyed so frame writes and the final close can find their ffmpeg process.
+const exportSessions = new Map();
+
+ipcMain.handle('export:begin', async (_event, { width, height, fps, audioPath }) => {
+  if (!ffmpegPath) return { ok: false, error: 'ffmpeg unavailable' };
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: 'Export captioned video',
+    defaultPath: 'captioned.mp4',
+    filters: [{ name: 'MP4 Video', extensions: ['mp4'] }],
+  });
+  if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+  const target = result.filePath;
+  const hasAudio = !!(audioPath && fs.existsSync(audioPath));
+
+  // Input 0: a stream of PNGs on stdin at the export frame rate.
+  // Input 1 (optional): the source file, for its audio only.
+  const args = ['-y', '-f', 'image2pipe', '-framerate', String(fps), '-i', 'pipe:0'];
+  if (hasAudio) args.push('-i', audioPath);
+  args.push(
+    '-map', '0:v:0',
+    ...(hasAudio ? ['-map', '1:a:0?'] : []), // '?' → tolerate a source with no audio
+    // Even dimensions (yuv420p/H.264 requirement).
+    '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+    '-r', String(fps),
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18', '-preset', 'medium',
+    '-movflags', '+faststart',
+  );
+  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '192k', '-shortest');
+  args.push(target);
+
+  const proc = spawn(ffmpegPath, args);
+  const session = { proc, target, stderr: '', error: null };
+  proc.stderr.on('data', (d) => {
+    session.stderr += d.toString();
+    if (session.stderr.length > 4000) session.stderr = session.stderr.slice(-4000);
+  });
+  proc.on('error', (e) => { session.error = e; });
+  // Swallow stdin EPIPE so a crashed ffmpeg surfaces via the close code, not an
+  // uncaught exception when the renderer's next frame write lands.
+  proc.stdin.on('error', () => {});
+  const sessionId = `exp-${Date.now()}`;
+  exportSessions.set(sessionId, session);
+  return { ok: true, sessionId };
+});
+
+ipcMain.handle('export:write-frame', (_event, { sessionId, buffer }) => {
+  const s = exportSessions.get(sessionId);
+  if (!s) return { ok: false, error: 'export session not found' };
+  if (s.error) return { ok: false, error: String(s.error) };
+  // Respect backpressure: resolve once the chunk is buffered or drained, so the
+  // renderer naturally paces itself to ffmpeg's encoding speed.
+  return new Promise((resolve) => {
+    const ok = s.proc.stdin.write(Buffer.from(buffer));
+    if (ok) resolve({ ok: true });
+    else s.proc.stdin.once('drain', () => resolve({ ok: true }));
+  });
+});
+
+ipcMain.handle('export:end', async (_event, { sessionId, cancel }) => {
+  const s = exportSessions.get(sessionId);
+  if (!s) return { ok: false, error: 'export session not found' };
+  exportSessions.delete(sessionId);
+
+  if (cancel) {
+    try { s.proc.stdin.destroy(); } catch (_) {}
+    try { s.proc.kill('SIGKILL'); } catch (_) {}
+    try { fs.existsSync(s.target) && fs.unlinkSync(s.target); } catch (_) {}
+    return { ok: false, canceled: true };
+  }
+
+  const done = new Promise((resolve, reject) => {
+    s.proc.on('close', (code) => (code === 0
+      ? resolve()
+      : reject(new Error(`ffmpeg exited with code ${code}\n${s.stderr.slice(-1500)}`))));
+    s.proc.on('error', reject);
+  });
+  try { s.proc.stdin.end(); } catch (_) {}
+  try {
+    await done;
+  } catch (err) {
+    try { fs.existsSync(s.target) && fs.unlinkSync(s.target); } catch (_) {}
+    dialog.showErrorBox('Video export failed', String(err));
+    return { ok: false, error: String(err) };
+  }
+  return { ok: true, path: s.target };
+});
+
 // Temp playback copies we create for formats Chromium can't decode (HEVC,
 // .mkv, …). Tracked so we can clean them up on quit.
 const playbackTemps = new Set();
