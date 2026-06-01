@@ -17,6 +17,9 @@ const state = {
   /** @type {Cue[]} */
   cues: [],
   activeCueId: /** @type {string|null} */ (null),
+  // Export render resolution: 'native' (source size), 'preview' (match the
+  // on-screen sharpness — display × devicePixelRatio, capped), or '2x'.
+  exportScale: 'preview',
   box: { ...DEFAULT_BOX },
   style: {
     align: 'justify',
@@ -139,6 +142,7 @@ function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
       style: state.style,
       box: state.box,
+      exportScale: state.exportScale,
       auto: { model: $('#ac-model').value, lang: $('#ac-lang').value, translate: $('#ac-translate').checked },
     }));
   } catch (_) {}
@@ -151,6 +155,7 @@ function loadSettings() {
     const s = JSON.parse(raw);
     if (s.style) state.style = { ...state.style, ...s.style };
     if (s.box) state.box = { ...DEFAULT_BOX, ...s.box };
+    if (s.exportScale) state.exportScale = s.exportScale;
     if (s.auto) pendingAuto = s.auto;
   } catch (_) {}
 }
@@ -246,23 +251,28 @@ video.addEventListener('loadedmetadata', () => {
   positionContainer();
 });
 
+// While exporting we drive playback ourselves (and toggle play/pause per frame
+// in the offline path), so the normal player UI handlers must stand down.
 video.addEventListener('timeupdate', () => {
+  if (exporting) return;
   seek.value = String(Math.floor(video.currentTime * 100));
   timeCurrent.textContent = fmtTime(video.currentTime);
   updateActiveCaption();
 });
 
 video.addEventListener('play', () => {
+  if (exporting) return;
   btnPlay.textContent = '❚❚';
   container.classList.add('playing');
   startCaptionLoop();
 });
 video.addEventListener('pause', () => {
+  if (exporting) return;
   btnPlay.textContent = '▶';
   container.classList.remove('playing');
   stopCaptionLoop();
 });
-video.addEventListener('ended', stopCaptionLoop);
+video.addEventListener('ended', () => { if (!exporting) stopCaptionLoop(); });
 
 // Surface decode/codec failures instead of silently showing a black stage,
 // and offer to convert formats Chromium can't play (HEVC .mov, .mkv, …) using
@@ -879,6 +889,8 @@ function bindStyleControls() {
   bind('#style-reveal', 'reveal', (v) => Number(v) / 100, '#reveal-val');
   bind('#style-reveal-rise', 'revealRise', (v) => Number(v) / 100, '#reveal-rise-val', pct);
   bind('#style-reveal-blur', 'revealBlur', (v) => Number(v) / 100, '#reveal-blur-val', pct);
+  // Export quality is a session preference, not a caption style.
+  $('#export-scale').addEventListener('change', (e) => { state.exportScale = e.target.value; saveSettings(); });
 }
 
 function buildSwatches() {
@@ -938,6 +950,7 @@ function syncControlsFromState() {
   $('#reveal-rise-val').textContent = Math.round(s.revealRise * 100);
   $('#style-reveal-blur').value = Math.round(s.revealBlur * 100);
   $('#reveal-blur-val').textContent = Math.round(s.revealBlur * 100);
+  $('#export-scale').value = state.exportScale;
   applyStyle();
   updateBgFieldVisibility();
   updateOutlineVisibility();
@@ -1315,23 +1328,58 @@ async function exportVideo() {
 // canvas, and stream the PNGs into ffmpeg (which muxes the original audio and
 // encodes a single time). Returns 'unsupported' if the main process reports no
 // ffmpeg, so the caller can fall back to the real-time MediaRecorder path.
+// Choose the export raster size. The on-screen preview renders text at
+// display-size × devicePixelRatio, which on a HiDPI screen often exceeds the
+// video's native resolution — so a native-res export looks softer than the
+// preview. Supersample up to that effective resolution (capped at ~4K wide, and
+// never below native) so exported text is as crisp as the preview; the higher
+// render res also gives 4:2:0 chroma effectively native resolution, sharpening
+// colored text edges (e.g. red captions on green).
+function computeExportSize(rect, mode) {
+  const dpr = window.devicePixelRatio || 1;
+  const nativeW = video.videoWidth, nativeH = video.videoHeight;
+  let ss;
+  if (mode === 'native') ss = 1;
+  else if (mode === '2x') ss = 2;
+  else if (mode === '1080') ss = Math.min(1, 1080 / nativeH); // downscale tall sources
+  else if (mode === '720') ss = Math.min(1, 720 / nativeH);
+  else ss = clamp(rect && rect.width ? (rect.width * dpr) / nativeW : 1, 1, 2); // 'preview'
+  const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+  let w = even(nativeW * ss), h = even(nativeH * ss);
+  const CAP = 3840;
+  const maxOut = Math.max(w, h), maxNative = Math.max(nativeW, nativeH);
+  if (maxOut > CAP) { const f = Math.max(CAP, maxNative) / maxOut; w = even(w * f); h = even(h * f); }
+  return { w, h };
+}
+
 async function exportVideoOffline() {
   exporting = true;
   const wasPaused = video.paused;
   const resumeAt = video.currentTime;
+  const savedRate = video.playbackRate;
+  const savedMuted = video.muted;
   video.pause();
 
-  const canvas = document.createElement('canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext('2d');
+  // Per-frame callback is what lets us drive capture off playback; without it
+  // fall back to the real-time MediaRecorder path.
+  if (typeof video.requestVideoFrameCallback !== 'function') {
+    exporting = false;
+    return 'unsupported';
+  }
+
   const exportRect = getVideoRect();
+  const { w: outW, h: outH } = computeExportSize(exportRect, state.exportScale);
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
 
   showProgress('Exporting captioned video', true);
   setProgress(null, 'Detecting frame rate…');
   const fps = await detectFrameRate(state.videoUrl);
   const duration = video.duration || 0;
-  const totalFrames = Math.max(1, Math.round(duration * fps));
 
   const begin = await window.api.beginExport({
     width: canvas.width, height: canvas.height, fps, audioPath: state.videoPath,
@@ -1347,47 +1395,91 @@ async function exportVideoOffline() {
   let cancelled = false;
   onCancel = () => { cancelled = true; };
 
-  // Seek to t and wait until the decoded frame is ready to composite. We resolve
-  // on 'seeked' (+ one rAF so the frame has settled); skip the wait when already
-  // parked on t, since 'seeked' wouldn't fire and we'd hang.
-  const seekTo = (t) => new Promise((resolve) => {
-    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; }
-    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); requestAnimationFrame(resolve); };
-    video.addEventListener('seeked', onSeeked);
-    video.currentTime = t;
+  // Raw RGBA readback (getImageData) instead of PNG: ~8× faster, and ffmpeg
+  // re-encodes anyway so the PNG compression was wasted work. ffmpeg reads these
+  // as -f rawvideo -pix_fmt rgba at the canvas dimensions.
+  const frameBytes = () => ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const restore = () => {
+    video.playbackRate = savedRate; video.muted = savedMuted;
+    video.currentTime = resumeAt;
+    if (!wasPaused) video.play();
+  };
+
+  // Capture by *playing* the video rather than seeking each frame: playback
+  // decodes sequentially and stays warm (seeking re-decodes from a keyframe per
+  // frame — far slower). Inside each frame callback we pause before doing async
+  // work so the video can't advance and drop frames, encode, then resume — so
+  // playback is gated by our encode pipeline, not wall-clock, and an elevated
+  // playbackRate just shortens the wait for the next frame. We mux the source
+  // audio in ffmpeg, so the capture itself needs no audio.
+  const EXPORT_RATE = 4;
+  video.muted = true;
+  video.playbackRate = EXPORT_RATE;
+
+  // Rewind so the first presented frame is the start of the clip.
+  await new Promise((resolve) => {
+    if (video.currentTime < 1e-3) { resolve(); return; }
+    const on = () => { video.removeEventListener('seeked', on); resolve(); };
+    video.addEventListener('seeked', on);
+    video.currentTime = 0;
   });
-  const frameToPng = () => new Promise((resolve, reject) =>
-    canvas.toBlob((b) => (b ? b.arrayBuffer().then(resolve, reject) : reject(new Error('frame encode failed'))), 'image/png'));
 
   const startedAt = performance.now();
+  let count = 0;
+  let lastT = -1;
+  let prevWrite = Promise.resolve({ ok: true });
+
   try {
-    for (let i = 0; i < totalFrames; i++) {
-      if (cancelled) break;
-      const t = Math.min(i / fps, Math.max(0, duration - 1e-3));
-      await seekTo(t);
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(t), t, exportRect);
-      const png = await frameToPng();
-      const res = await window.api.writeExportFrame({ sessionId, buffer: new Uint8Array(png) });
-      if (!res.ok) throw new Error(res.error || 'frame write failed');
-      if (i % 3 === 0 || i === totalFrames - 1) {
-        const done = i + 1;
-        // ETA from the rate achieved so far (frames/sec). Skip the first few
-        // frames while the seek pipeline warms up so the estimate isn't wild.
-        const elapsed = (performance.now() - startedAt) / 1000;
-        let eta = '';
-        if (done >= 4 && elapsed > 0) {
-          const remaining = (totalFrames - done) * (elapsed / done);
-          eta = ` · ~${fmtDuration(remaining)} left (${(done / elapsed).toFixed(1)} fps)`;
-        }
-        setProgress((done / totalFrames) * 100, `Rendering frame ${done} / ${totalFrames}${eta}`);
-      }
-    }
+    await new Promise((resolve, reject) => {
+      let finished = false;
+      const stop = (err) => { if (finished) return; finished = true; video.pause(); err ? reject(err) : resolve(); };
+      video.addEventListener('ended', () => stop(), { once: true });
+
+      const onFrame = async (_now, meta) => {
+        if (finished) return;
+        try {
+          video.pause(); // freeze before async work so no frame slips past uncaptured
+          const t = meta && meta.mediaTime != null ? meta.mediaTime : video.currentTime;
+          // Skip duplicates (same frame presented twice) — they'd desync A/V.
+          if (t <= lastT) {
+            if (cancelled) { stop(); return; }
+            video.requestVideoFrameCallback(onFrame);
+            await video.play();
+            return;
+          }
+          lastT = t;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(t), t, exportRect);
+          const rgba = frameBytes();
+          const r = await prevWrite;
+          if (!r.ok) throw new Error(r.error || 'frame write failed');
+          prevWrite = window.api.writeExportFrame({ sessionId, buffer: new Uint8Array(rgba.buffer) });
+          count++;
+
+          const elapsed = (performance.now() - startedAt) / 1000;
+          let eta = '';
+          if (count >= 4 && t > 0 && elapsed > 0) {
+            const remaining = (elapsed / t) * (duration - t);
+            eta = ` · ~${fmtDuration(remaining)} left (${(count / elapsed).toFixed(1)} fps)`;
+          }
+          setProgress(duration ? (t / duration) * 100 : 0, `Rendering ${fmtTime(t)} / ${fmtTime(duration)}${eta}`);
+
+          if (cancelled) { stop(); return; }
+          video.requestVideoFrameCallback(onFrame);
+          await video.play();
+        } catch (err) { stop(err); }
+      };
+
+      video.requestVideoFrameCallback(onFrame);
+      video.play().catch(reject);
+    });
+    const last = await prevWrite;
+    if (!last.ok) throw new Error(last.error || 'frame write failed');
   } catch (err) {
     await window.api.endExport({ sessionId, cancel: true });
     exporting = false; onCancel = null; hideProgress();
     setError('Export failed: ' + ((err && err.message) || err));
-    if (!wasPaused) video.play();
+    restore();
     return;
   }
 
@@ -1395,19 +1487,17 @@ async function exportVideoOffline() {
     await window.api.endExport({ sessionId, cancel: true });
     exporting = false; onCancel = null; hideProgress();
     setStatus('Export cancelled.', true);
-    video.currentTime = resumeAt;
-    if (!wasPaused) video.play();
+    restore();
     return;
   }
 
   setProgress(null, 'Encoding to MP4…');
   const res = await window.api.endExport({ sessionId, cancel: false });
   exporting = false; onCancel = null; hideProgress();
-  if (res.ok) setStatus(`Exported video to ${res.path}`, true);
+  if (res.ok) setStatus(`Exported video to ${res.path} (${count} frames)`, true);
   else if (res.canceled) setStatus('Export cancelled.', true);
   else setError('Export failed — see error dialog.');
-  video.currentTime = resumeAt;
-  if (!wasPaused) video.play();
+  restore();
 }
 
 // Coarse human-readable duration for the export ETA ("45s", "1m 20s", "1h 3m").
@@ -1426,14 +1516,19 @@ async function exportVideoRealtime() {
   const wasPaused = video.paused;
   video.pause();
 
-  const canvas = document.createElement('canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext('2d');
-
   // The video content rectangle is constant for the whole export — measure it
   // once instead of forcing a reflow (getBoundingClientRect) on every frame.
   const exportRect = getVideoRect();
+
+  // Supersample to the preview's effective resolution so text matches it (see
+  // computeExportSize); the canvas drives font/box scaling in drawCueToCanvas.
+  const { w: rtW, h: rtH } = computeExportSize(exportRect, state.exportScale);
+  const canvas = document.createElement('canvas');
+  canvas.width = rtW;
+  canvas.height = rtH;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
 
   // Capture at the source's frame rate so 24/60fps clips aren't resampled to 30.
   setProgress(null, 'Detecting frame rate…');

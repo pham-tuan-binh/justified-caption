@@ -1,0 +1,201 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>export bench</title></head>
+<body>
+<script src="../src/renderer/caption-render.js"></script>
+<script>
+// Measures the per-frame cost of each export stage so we can see which one
+// dominates (and whether resolution — the quality setting — even matters).
+const log = (m) => console.log(m);
+const qs = new URLSearchParams(location.search);
+const VIDEO = qs.get('video');
+const N = 50; // frames per measurement
+
+const once = (el, ev) => new Promise((r) => el.addEventListener(ev, r, { once: true }));
+const toBlobMs = (canvas) => new Promise((r) => canvas.toBlob(() => r(), 'image/png'));
+
+function seek(video, t) {
+  return new Promise((resolve) => {
+    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; }
+    const on = () => { video.removeEventListener('seeked', on); resolve(); };
+    video.addEventListener('seeked', on);
+    video.currentTime = t;
+  });
+}
+
+// Pause-step capture. `awaitPlay` mirrors the real export, which does
+// `await video.play()` every frame — the suspected fixed per-frame cost.
+function playbackStep(video, n, rate, awaitPlay) {
+  return new Promise((resolve, reject) => {
+    video.playbackRate = rate;
+    let count = 0, t0 = 0;
+    const onFrame = async () => {
+      try {
+        video.pause();
+        if (count === 0) t0 = performance.now();
+        count++;
+        if (count >= n) { resolve((performance.now() - t0) / (n - 1)); return; }
+        video.requestVideoFrameCallback(onFrame);
+        if (awaitPlay) await video.play(); else video.play();
+      } catch (e) { reject(e); }
+    };
+    video.currentTime = 0;
+    video.requestVideoFrameCallback(onFrame);
+    video.play();
+  });
+}
+
+// Continuous playback: how many frames/sec rVFC can deliver with NO per-frame
+// pause and NO encoding — the ceiling for play-based capture.
+function continuousFps(video, rate, ms) {
+  return new Promise((resolve) => {
+    video.playbackRate = rate;
+    let count = 0, start = 0;
+    const onFrame = () => {
+      if (count === 0) start = performance.now();
+      count++;
+      const el = performance.now() - start;
+      if (el >= ms) { video.pause(); resolve(count / (el / 1000)); return; }
+      video.requestVideoFrameCallback(onFrame);
+    };
+    video.currentTime = 0;
+    video.requestVideoFrameCallback(onFrame);
+    video.play();
+  });
+}
+
+async function avg(fn) { const t0 = performance.now(); await fn(); return (performance.now() - t0); }
+const withTimeout = (p, ms, fallback) => Promise.race([p, new Promise((r) => setTimeout(() => r(fallback), ms))]);
+const step = (m) => console.log('STEP ' + m);
+
+(async () => {
+  try {
+    const video = document.createElement('video');
+    video.muted = true; video.playsInline = true; video.src = VIDEO;
+    document.body.appendChild(video); // in-DOM so frames present (rVFC fires)
+    await once(video, 'loadeddata');
+    const W = video.videoWidth, H = video.videoHeight, fps = 30;
+    step(`loaded ${W}x${H}`);
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+
+    // 1) seek-only (set currentTime, await 'seeked') — pure decode/seek cost.
+    await seek(video, 0);
+    let ms = await avg(async () => { for (let i = 0; i < N; i++) await seek(video, i / fps); });
+    const seekMs = ms / N; step(`seek-only: ${seekMs.toFixed(1)} ms/frame`);
+
+    // 2) toBlob PNG cost at native vs 2× (resolution-dependent encode).
+    canvas.width = W; canvas.height = H; ctx.drawImage(video, 0, 0, W, H);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await toBlobMs(canvas); });
+    const blobNative = ms / N; step(`toBlob native: ${blobNative.toFixed(1)} ms/frame`);
+    canvas.width = W * 2; canvas.height = H * 2; ctx.drawImage(video, 0, 0, W * 2, H * 2);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await toBlobMs(canvas); });
+    const blob2x = ms / N; step(`toBlob 2x: ${blob2x.toFixed(1)} ms/frame`);
+
+    // 3) full seek+draw+encode loop at native and 2× (what the old path did).
+    canvas.width = W; canvas.height = H;
+    await seek(video, 0);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) { await seek(video, i / fps); ctx.drawImage(video, 0, 0, W, H); await toBlobMs(canvas); } });
+    const fullNative = ms / N; step(`full seek+encode native: ${fullNative.toFixed(1)} ms/frame`);
+    canvas.width = W * 2; canvas.height = H * 2;
+    await seek(video, 0);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) { await seek(video, i / fps); ctx.drawImage(video, 0, 0, W * 2, H * 2); await toBlobMs(canvas); } });
+    const full2x = ms / N; step(`full seek+encode 2x: ${full2x.toFixed(1)} ms/frame`);
+
+    // 3a2) alternative readbacks at native: raw getImageData and WebP vs PNG.
+    const toBlobType = (cnv, type, q) => new Promise((r) => cnv.toBlob(() => r(), type, q));
+    canvas.width = W; canvas.height = H; ctx.drawImage(video, 0, 0, W, H);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) ctx.getImageData(0, 0, W, H); }); const getIDNative = ms / N; step(`getImageData native: ${getIDNative.toFixed(1)} ms/frame`);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await toBlobType(canvas, 'image/webp', 0.92); }); const webpNative = ms / N; step(`toBlob webp native: ${webpNative.toFixed(1)} ms/frame`);
+
+    // 3b) per-frame IPC round-trip (renderer→main) for a real PNG buffer, at
+    // native and 2× — the stage the export does but the bench above omitted.
+    const pngBuf = (cnv) => new Promise((r) => cnv.toBlob((b) => b.arrayBuffer().then((a) => r(new Uint8Array(a))), 'image/png'));
+    canvas.width = W; canvas.height = H; ctx.drawImage(video, 0, 0, W, H);
+    let buf = await pngBuf(canvas);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await window.bench.write(buf); });
+    const ipcNative = ms / N; step(`IPC write native (${(buf.length / 1024).toFixed(0)}KB): ${ipcNative.toFixed(1)} ms/frame`);
+    canvas.width = W * 2; canvas.height = H * 2; ctx.drawImage(video, 0, 0, W * 2, H * 2);
+    buf = await pngBuf(canvas);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await window.bench.write(buf); });
+    const ipc2x = ms / N; step(`IPC write 2x (${(buf.length / 1024).toFixed(0)}KB): ${ipc2x.toFixed(1)} ms/frame`);
+    // raw RGBA buffer IPC (what a getImageData pipeline would send), native size.
+    const raw = new Uint8Array(W * H * 4);
+    ms = await avg(async () => { for (let i = 0; i < N; i++) await window.bench.write(raw); });
+    step(`IPC write raw RGBA native (${(raw.length / 1024 / 1024).toFixed(1)}MB): ${(ms / N).toFixed(1)} ms/frame`);
+
+    // 3c) caption rendering cost (the stage the loop above omitted). Mid-reveal
+    // `atTime` so several words are animating (per-word ctx.filter blur active).
+    const words = 'when something is important enough you do it'.split(' ').map((w, k) => ({ text: w, start: k * 0.3, end: k * 0.3 + 0.3 }));
+    const capOpts = (scale, reveal) => ({
+      x: 0, y: 0, w: W * scale, h: H * scale, pad: 8 * scale,
+      font: "'Arial', sans-serif", weight: '700', fontSize: 52 * scale, lineHeight: 52 * scale * 1.15,
+      color: '#6b1414', align: 'justify', valign: 'center', bgMode: 'none',
+      words, atTime: 1.0, reveal, revealRise: 0.5, revealBlur: 0.18,
+    });
+    const drawCap = (scale, reveal) => { const o = capOpts(scale, reveal); for (let i = 0; i < N; i++) { o.atTime = 0.5 + (i % 10) * 0.1; CaptionRender.drawCaption(ctx, o); } };
+    canvas.width = W; canvas.height = H;
+    ms = await avg(async () => drawCap(1, 0.32)); const capNativeReveal = ms / N; step(`drawCaption native (reveal on): ${capNativeReveal.toFixed(1)} ms/frame`);
+    ms = await avg(async () => drawCap(1, 0)); const capNativeNo = ms / N; step(`drawCaption native (reveal off): ${capNativeNo.toFixed(1)} ms/frame`);
+    canvas.width = W * 2; canvas.height = H * 2;
+    ms = await avg(async () => drawCap(2, 0.32)); const cap2xReveal = ms / N; step(`drawCaption 2x (reveal on): ${cap2xReveal.toFixed(1)} ms/frame`);
+    ms = await avg(async () => drawCap(2, 0)); const cap2xNo = ms / N; step(`drawCaption 2x (reveal off): ${cap2xNo.toFixed(1)} ms/frame`);
+
+    // 4) playback pause-step, no encode: without and WITH `await play()`.
+    const stepMs = await withTimeout(playbackStep(video, N, 4, false), 8000, -1); step(`pause-step (no await play): ${stepMs.toFixed(1)} ms/frame`);
+    const stepAwaitMs = await withTimeout(playbackStep(video, N, 4, true), 20000, -1); step(`pause-step (await play, like export): ${stepAwaitMs.toFixed(1)} ms/frame → ${(1000 / stepAwaitMs).toFixed(1)} fps`);
+
+    // 5) continuous-play ceiling at 1× and 4×.
+    const cont1 = await withTimeout(continuousFps(video, 1, 1500), 6000, -1); step(`continuous 1x: ${cont1.toFixed(1)} fps`);
+    const cont4 = await withTimeout(continuousFps(video, 4, 1500), 6000, -1); step(`continuous 4x: ${cont4.toFixed(1)} fps`);
+
+    // 6) END-TO-END: full seek+readback+IPC loop through real ffmpeg, PNG vs raw.
+    // Full raw pipeline at an output size (ow×oh) — models the downscale options.
+    const full = async (mode, ow, oh) => {
+      const id = await window.bench.ffBegin({ mode, width: ow, height: oh, fps });
+      canvas.width = ow; canvas.height = oh;
+      await seek(video, 0);
+      const t0 = performance.now();
+      let prev = Promise.resolve();
+      const M = 40;
+      for (let i = 0; i < M; i++) {
+        await seek(video, i / fps);
+        ctx.drawImage(video, 0, 0, ow, oh);
+        let buf;
+        if (mode === 'raw') buf = new Uint8Array(ctx.getImageData(0, 0, ow, oh).data.buffer);
+        else buf = new Uint8Array(await new Promise((r) => canvas.toBlob((b) => b.arrayBuffer().then(r), 'image/png')));
+        await prev; prev = window.bench.ffWrite({ id, buffer: buf });
+      }
+      await prev;
+      const r = await window.bench.ffEnd({ id });
+      const per = (performance.now() - t0) / M;
+      return { perFrame: +per.toFixed(1), fps: +(1000 / per).toFixed(1), code: r.code };
+    };
+    const e2ePng = await full('png', W, H); step(`E2E PNG native ${W}x${H}: ${e2ePng.fps} fps`);
+    const e2eRaw = await full('raw', W, H); step(`E2E RAW native ${W}x${H}: ${e2eRaw.fps} fps`);
+    const ar = W / H;
+    const e2eRaw1080 = await full('raw', Math.round(1080 * ar / 2) * 2, 1080); step(`E2E RAW 1080p: ${e2eRaw1080.fps} fps`);
+    const e2eRaw720 = await full('raw', Math.round(720 * ar / 2) * 2, 720); step(`E2E RAW 720p: ${e2eRaw720.fps} fps`);
+
+    log('BENCH ' + JSON.stringify({
+      e2e_png_fps: e2ePng.fps, e2e_raw_fps: e2eRaw.fps,
+      WxH: `${W}x${H}`, fps,
+      seekMs: +seekMs.toFixed(1),
+      blobNative: +blobNative.toFixed(1),
+      blob2x: +blob2x.toFixed(1),
+      ipcNative: +ipcNative.toFixed(1),
+      ipc2x: +ipc2x.toFixed(1),
+      fullNative_perFrame: +fullNative.toFixed(1), fullNative_fps: +(1000 / fullNative).toFixed(1),
+      full2x_perFrame: +full2x.toFixed(1), full2x_fps: +(1000 / full2x).toFixed(1),
+      playbackStep_perFrame: +stepMs.toFixed(1), playbackStep_fps: +(1000 / stepMs).toFixed(1),
+      continuousPlay_1x_fps: +cont1.toFixed(1),
+      continuousPlay_4x_fps: +cont4.toFixed(1),
+    }));
+  } catch (e) {
+    log('BENCH_ERROR ' + (e && e.message || e));
+  }
+  log('BENCH_DONE');
+})();
+</script>
+</body>
+</html>

@@ -139,6 +139,9 @@ body {
 .menu-field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
 .menu-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text); cursor: pointer; }
 .menu-check input { accent-color: var(--accent); }
+/* A labelled field dropped into a button menu (e.g. export quality): pad it to
+   line up with the menu items and separate it from the buttons above. */
+.menu-panel-right .menu-field { padding: 8px 10px 6px; margin-top: 4px; border-top: 1px solid var(--border); gap: 6px; }
 .select {
   width: 100%; background: var(--panel-3); color: var(--text);
   border: 1px solid var(--border-strong); border-radius: var(--r-sm);

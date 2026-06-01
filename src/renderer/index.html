@@ -71,6 +71,16 @@
             <button id="btn-export-video" class="menu-item">Export Video…</button>
             <button id="btn-export-srt" class="menu-item">Export Subtitles (.srt)…</button>
             <button id="btn-export-frame" class="menu-item">Save Current Frame…</button>
+            <label class="menu-field">
+              <span>Video quality</span>
+              <select id="export-scale" class="select" title="Lower = much faster export and smaller files; higher = crisper text">
+                <option value="720">720p — fastest</option>
+                <option value="1080">1080p — fast</option>
+                <option value="native">Native (source size)</option>
+                <option value="preview" selected>Match preview — sharpest</option>
+                <option value="2x">2× — max</option>
+              </select>
+            </label>
           </div>
         </div>
         <button id="btn-help" class="tb-btn icon" title="Keyboard shortcuts">?</button>
