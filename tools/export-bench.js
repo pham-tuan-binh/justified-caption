@@ -68,13 +68,20 @@ ipcMain.handle('bench:ff-begin', (_e, { mode, width, height, fps }) => {
   const id = 's' + sinks.size; sinks.set(id, { proc, out, err: () => err });
   return id;
 });
-ipcMain.handle('bench:ff-write', (_e, { id, buffer }) => {
-  const s = sinks.get(id);
-  return new Promise((r) => { const ok = s.proc.stdin.write(Buffer.from(buffer)); ok ? r(true) : s.proc.stdin.once('drain', () => r(true)); });
+ipcMain.handle('bench:ff-write', (_e, { id, buffer, repeat }) => {
+  const s = sinks.get(id); const buf = Buffer.from(buffer); const n = Math.max(1, repeat || 1);
+  return new Promise((r) => { let ok = true; for (let i = 0; i < n; i++) ok = s.proc.stdin.write(buf); ok ? r(true) : s.proc.stdin.once('drain', () => r(true)); });
 });
+function probeDuration(file) {
+  return new Promise((res) => {
+    const p = spawn(ffmpegPath, ['-i', file]); let e = '';
+    p.stderr.on('data', (d) => { e += d; });
+    p.on('close', () => { const m = e.match(/Duration: (\d+):(\d+):(\d+\.\d+)/); res(m ? (+m[1] * 3600 + +m[2] * 60 + parseFloat(m[3])) : null); });
+  });
+}
 ipcMain.handle('bench:ff-end', (_e, { id }) => {
   const s = sinks.get(id); sinks.delete(id);
-  return new Promise((res) => { s.proc.on('close', (c) => res({ code: c, out: s.out })); s.proc.stdin.end(); });
+  return new Promise((res) => { s.proc.on('close', async (c) => res({ code: c, out: s.out, duration: await probeDuration(s.out) })); s.proc.stdin.end(); });
 });
 
 app.whenReady().then(async () => {

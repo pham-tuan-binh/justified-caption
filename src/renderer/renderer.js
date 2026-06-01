@@ -1356,16 +1356,7 @@ async function exportVideoOffline() {
   exporting = true;
   const wasPaused = video.paused;
   const resumeAt = video.currentTime;
-  const savedRate = video.playbackRate;
-  const savedMuted = video.muted;
   video.pause();
-
-  // Per-frame callback is what lets us drive capture off playback; without it
-  // fall back to the real-time MediaRecorder path.
-  if (typeof video.requestVideoFrameCallback !== 'function') {
-    exporting = false;
-    return 'unsupported';
-  }
 
   const exportRect = getVideoRect();
   const { w: outW, h: outH } = computeExportSize(exportRect, state.exportScale);
@@ -1380,6 +1371,13 @@ async function exportVideoOffline() {
   setProgress(null, 'Detecting frame rate…');
   const fps = await detectFrameRate(state.videoUrl);
   const duration = video.duration || 0;
+  // Deterministic frame set: exactly N frames at a fixed grid. This is what
+  // makes the output correct — exactly duration·fps frames at `fps` gives the
+  // right length and keeps it in sync with the muxed audio, independent of
+  // machine speed, display refresh, or codec. (Capturing off playback is
+  // faster but drops frames when the rate outruns the compositor, which
+  // shortens/desyncs the result — so we seek to each frame instead.)
+  const totalFrames = Math.max(1, Math.round(duration * fps));
 
   const begin = await window.api.beginExport({
     width: canvas.width, height: canvas.height, fps, audioPath: state.videoPath,
@@ -1399,80 +1397,50 @@ async function exportVideoOffline() {
   // re-encodes anyway so the PNG compression was wasted work. ffmpeg reads these
   // as -f rawvideo -pix_fmt rgba at the canvas dimensions.
   const frameBytes = () => ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-  const restore = () => {
-    video.playbackRate = savedRate; video.muted = savedMuted;
-    video.currentTime = resumeAt;
-    if (!wasPaused) video.play();
+  const restore = () => { video.currentTime = resumeAt; if (!wasPaused) video.play(); };
+
+  // Seek to a frame's mid-point time and resolve once the decoded frame is on
+  // screen (drawImage-able). Mid-frame sampling (i+0.5)/fps lands unambiguously
+  // inside frame i rather than on a boundary. A timeout guards against any seek
+  // that never fires 'seeked' so the export can't hang.
+  const seekToFrame = (i) => {
+    const t = Math.min((i + 0.5) / fps, Math.max(0, duration - 1e-3));
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => { if (settled) return; settled = true; clearTimeout(timer); video.removeEventListener('seeked', onSeeked); requestAnimationFrame(() => resolve(t)); };
+      const onSeeked = () => done();
+      const timer = setTimeout(done, 3000);
+      if (Math.abs(video.currentTime - t) < 1e-6) { done(); return; }
+      video.addEventListener('seeked', onSeeked);
+      video.currentTime = t;
+    });
   };
 
-  // Capture by *playing* the video rather than seeking each frame: playback
-  // decodes sequentially and stays warm (seeking re-decodes from a keyframe per
-  // frame — far slower). Inside each frame callback we pause before doing async
-  // work so the video can't advance and drop frames, encode, then resume — so
-  // playback is gated by our encode pipeline, not wall-clock, and an elevated
-  // playbackRate just shortens the wait for the next frame. We mux the source
-  // audio in ffmpeg, so the capture itself needs no audio.
-  const EXPORT_RATE = 4;
-  video.muted = true;
-  video.playbackRate = EXPORT_RATE;
-
-  // Rewind so the first presented frame is the start of the clip.
-  await new Promise((resolve) => {
-    if (video.currentTime < 1e-3) { resolve(); return; }
-    const on = () => { video.removeEventListener('seeked', on); resolve(); };
-    video.addEventListener('seeked', on);
-    video.currentTime = 0;
-  });
-
   const startedAt = performance.now();
-  let count = 0;
-  let lastT = -1;
   let prevWrite = Promise.resolve({ ok: true });
-
   try {
-    await new Promise((resolve, reject) => {
-      let finished = false;
-      const stop = (err) => { if (finished) return; finished = true; video.pause(); err ? reject(err) : resolve(); };
-      video.addEventListener('ended', () => stop(), { once: true });
-
-      const onFrame = async (_now, meta) => {
-        if (finished) return;
-        try {
-          video.pause(); // freeze before async work so no frame slips past uncaptured
-          const t = meta && meta.mediaTime != null ? meta.mediaTime : video.currentTime;
-          // Skip duplicates (same frame presented twice) — they'd desync A/V.
-          if (t <= lastT) {
-            if (cancelled) { stop(); return; }
-            video.requestVideoFrameCallback(onFrame);
-            await video.play();
-            return;
-          }
-          lastT = t;
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(t), t, exportRect);
-          const rgba = frameBytes();
-          const r = await prevWrite;
-          if (!r.ok) throw new Error(r.error || 'frame write failed');
-          prevWrite = window.api.writeExportFrame({ sessionId, buffer: new Uint8Array(rgba.buffer) });
-          count++;
-
-          const elapsed = (performance.now() - startedAt) / 1000;
-          let eta = '';
-          if (count >= 4 && t > 0 && elapsed > 0) {
-            const remaining = (elapsed / t) * (duration - t);
-            eta = ` · ~${fmtDuration(remaining)} left (${(count / elapsed).toFixed(1)} fps)`;
-          }
-          setProgress(duration ? (t / duration) * 100 : 0, `Rendering ${fmtTime(t)} / ${fmtTime(duration)}${eta}`);
-
-          if (cancelled) { stop(); return; }
-          video.requestVideoFrameCallback(onFrame);
-          await video.play();
-        } catch (err) { stop(err); }
-      };
-
-      video.requestVideoFrameCallback(onFrame);
-      video.play().catch(reject);
-    });
+    for (let i = 0; i < totalFrames; i++) {
+      if (cancelled) break;
+      const t = await seekToFrame(i);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      drawCueToCanvas(ctx, canvas.width, canvas.height, activeCueAt(t), t, exportRect);
+      const rgba = frameBytes();
+      // Overlap ffmpeg I/O: ensure the previous write landed (ordering +
+      // backpressure), then fire this one and seek/draw the next.
+      const r = await prevWrite;
+      if (!r.ok) throw new Error(r.error || 'frame write failed');
+      prevWrite = window.api.writeExportFrame({ sessionId, buffer: new Uint8Array(rgba.buffer) });
+      if (i % 3 === 0 || i === totalFrames - 1) {
+        const done = i + 1;
+        const elapsed = (performance.now() - startedAt) / 1000;
+        let eta = '';
+        if (done >= 4 && elapsed > 0) {
+          const remaining = (totalFrames - done) * (elapsed / done);
+          eta = ` · ~${fmtDuration(remaining)} left (${(done / elapsed).toFixed(1)} fps)`;
+        }
+        setProgress((done / totalFrames) * 100, `Rendering frame ${done} / ${totalFrames}${eta}`);
+      }
+    }
     const last = await prevWrite;
     if (!last.ok) throw new Error(last.error || 'frame write failed');
   } catch (err) {
@@ -1494,7 +1462,7 @@ async function exportVideoOffline() {
   setProgress(null, 'Encoding to MP4…');
   const res = await window.api.endExport({ sessionId, cancel: false });
   exporting = false; onCancel = null; hideProgress();
-  if (res.ok) setStatus(`Exported video to ${res.path} (${count} frames)`, true);
+  if (res.ok) setStatus(`Exported video to ${res.path} (${totalFrames} frames)`, true);
   else if (res.canceled) setStatus('Export cancelled.', true);
   else setError('Export failed — see error dialog.');
   restore();

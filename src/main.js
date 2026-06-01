@@ -250,14 +250,20 @@ ipcMain.handle('export:begin', async (_event, { width, height, fps, audioPath })
   return { ok: true, sessionId };
 });
 
-ipcMain.handle('export:write-frame', (_event, { sessionId, buffer }) => {
+ipcMain.handle('export:write-frame', (_event, { sessionId, buffer, repeat }) => {
   const s = exportSessions.get(sessionId);
   if (!s) return { ok: false, error: 'export session not found' };
   if (s.error) return { ok: false, error: String(s.error) };
-  // Respect backpressure: resolve once the chunk is buffered or drained, so the
-  // renderer naturally paces itself to ffmpeg's encoding speed.
+  // `repeat` (default 1) writes the same frame N times to fill the output slots
+  // its timestamp spans — so dropped capture frames become held frames and the
+  // output keeps constant fps / correct duration regardless of capture cadence.
+  const buf = Buffer.from(buffer);
+  const n = Math.max(1, repeat || 1);
+  // Respect backpressure: resolve once buffered/drained so the renderer paces
+  // itself to ffmpeg's encoding speed.
   return new Promise((resolve) => {
-    const ok = s.proc.stdin.write(Buffer.from(buffer));
+    let ok = true;
+    for (let i = 0; i < n; i++) ok = s.proc.stdin.write(buf);
     if (ok) resolve({ ok: true });
     else s.proc.stdin.once('drain', () => resolve({ ok: true }));
   });

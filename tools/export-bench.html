@@ -177,6 +177,27 @@ const step = (m) => console.log('STEP ' + m);
     const e2eRaw1080 = await full('raw', Math.round(1080 * ar / 2) * 2, 1080); step(`E2E RAW 1080p: ${e2eRaw1080.fps} fps`);
     const e2eRaw720 = await full('raw', Math.round(720 * ar / 2) * 2, 720); step(`E2E RAW 720p: ${e2eRaw720.fps} fps`);
 
+    // CORRECTNESS: export the WHOLE clip via the deterministic seek path and
+    // verify output duration matches the source (the bug we're fixing).
+    const validate = async (ow, oh) => {
+      const id = await window.bench.ffBegin({ mode: 'raw', width: ow, height: oh, fps });
+      canvas.width = ow; canvas.height = oh;
+      const Nf = Math.max(1, Math.round(video.duration * fps));
+      let prev = Promise.resolve();
+      for (let i = 0; i < Nf; i++) {
+        const t = Math.min((i + 0.5) / fps, video.duration - 1e-3);
+        await seek(video, t);
+        ctx.drawImage(video, 0, 0, ow, oh);
+        const b = new Uint8Array(ctx.getImageData(0, 0, ow, oh).data.buffer);
+        await prev; prev = window.bench.ffWrite({ id, buffer: b });
+      }
+      await prev;
+      const r = await window.bench.ffEnd({ id });
+      return { frames: Nf, srcDur: +video.duration.toFixed(3), outDur: r.duration, code: r.code };
+    };
+    const v = await validate(960, 540);
+    step(`DURATION check: src=${v.srcDur}s out=${v.outDur}s frames=${v.frames} → ${Math.abs(v.srcDur - v.outDur) < 0.1 ? 'OK ✓' : 'MISMATCH ✗'}`);
+
     log('BENCH ' + JSON.stringify({
       e2e_png_fps: e2ePng.fps, e2e_raw_fps: e2eRaw.fps,
       WxH: `${W}x${H}`, fps,
